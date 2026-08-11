@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow-net
+    labels:
+      - "app=airflow-postgres"
+
+  airflow:
+    image: apache/airflow:2.8.0-python3.11
+    container_name: airflow-webserver
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Airflow configuration
+      AIRFLOW__CORE__DAGS_FOLDER: /usr/local/airflow/dags
+      AIRFLOW__CORE__BASE_LOG_FOLDER: /usr/local/airflow/logs
+      AIRFLOW__CORE__PLUGINS_FOLDER: /usr/local/airflow/plugins
+      AIRFLOW__DATABASE__SQLALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__UNIT_TEST_MODE: "false"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "change-me-in-production"
+      AIRFLOW__LOGGING__LOGGING_LEVEL: "INFO"
+
+      # AWS Credentials
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+
+      # Application Variables
+      TF_VAR_registry_name: ${TF_VAR_registry_name:-schema-registry}
+      PYTHONUNBUFFERED: 1
+
+      # Repo paths for DAG
+      AIRFLOW_VAR_repo_path: /app
+      AIRFLOW_VAR_contracts_dir: contracts/current
+      AIRFLOW_VAR_github_token: ${GITHUB_TOKEN}
+      AIRFLOW_VAR_github_repo: ${GITHUB_REPO}
+
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/usr/local/airflow/dags
+      - ./tasks:/usr/local/airflow/tasks
+      - ./lib:/usr/local/airflow/lib
+      - ./contracts:/app/contracts:ro
+      - airflow_logs:/usr/local/airflow/logs
+      - ./docker/airflow-entrypoint.sh:/entrypoint.sh
+    entrypoint: /entrypoint.sh
+    env_file:
+      - .env
+    networks:
+      - airflow-net
+    labels:
+      - "app=airflow-webserver"
+      - "version=2.8.0"
+    restart: unless-stopped
+
+networks:
+  airflow-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  airflow_logs:
