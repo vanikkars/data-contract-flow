@@ -1,1 +1,0 @@
-"""Registry API application package."""
