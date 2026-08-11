@@ -1,0 +1,266 @@
+name: Trigger Airflow DAG for Contract Provisioning
+
+on:
+  pull_request:
+    paths:
+      - 'contracts/current/**'
+      - '.github/workflows/trigger-airflow-dag.yml'
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+env:
+  AIRFLOW_DAG_ID: contract_provisioning
+  AIRFLOW_TIMEOUT: 600  # 10 minutes
+
+jobs:
+  trigger-airflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find changed contract files
+        id: changed-files
+        run: |
+          # Get the merge base to compare against
+          MERGE_BASE=$(git merge-base origin/${{ github.base_ref }} HEAD)
+
+          # Find all changed JSON files in contracts/current folder
+          CHANGED_FILES=$(git diff --name-only $MERGE_BASE HEAD -- 'contracts/current/**/*.json' | tr '\n' ' ')
+          echo "files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "Changed contract files: $CHANGED_FILES"
+
+      - name: Check if contracts changed
+        id: check-contracts
+        run: |
+          if [ -z "${{ steps.changed-files.outputs.files }}" ]; then
+            echo "::notice::No contract files changed, skipping DAG trigger"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "📋 Found changed contracts, will trigger Airflow DAG"
+          fi
+
+      - name: Trigger Airflow DAG
+        if: steps.check-contracts.outputs.has_changes == 'true'
+        id: trigger-dag
+        run: |
+          set -e
+
+          AIRFLOW_URL="${{ secrets.AIRFLOW_URL }}"
+          AIRFLOW_USERNAME="${{ secrets.AIRFLOW_USERNAME }}"
+          AIRFLOW_PASSWORD="${{ secrets.AIRFLOW_PASSWORD }}"
+
+          if [ -z "$AIRFLOW_URL" ]; then
+            echo "::error::AIRFLOW_URL secret not configured"
+            exit 1
+          fi
+
+          echo "🚀 Triggering Airflow DAG at $AIRFLOW_URL"
+
+          # Trigger DAG with GitHub context
+          RESPONSE=$(curl -s -X POST \
+            "$AIRFLOW_URL/api/v1/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns" \
+            -H "Content-Type: application/json" \
+            -u "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD" \
+            -d @- << EOF
+          {
+            "conf": {
+              "github_pr_number": ${{ github.event.pull_request.number }},
+              "github_repo": "${{ github.repository }}",
+              "github_token": "${{ secrets.GITHUB_TOKEN }}"
+            }
+          }
+          EOF
+          )
+
+          # Extract DAG run ID
+          DAG_RUN_ID=$(echo "$RESPONSE" | grep -o '"dag_run_id":"[^"]*"' | cut -d'"' -f4 || echo "")
+
+          if [ -z "$DAG_RUN_ID" ]; then
+            echo "::error::Failed to trigger DAG"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "dag_run_id=$DAG_RUN_ID" >> $GITHUB_OUTPUT
+          echo "✅ DAG triggered successfully (Run ID: $DAG_RUN_ID)"
+
+      - name: Wait for Airflow DAG completion
+        if: steps.check-contracts.outputs.has_changes == 'true'
+        id: wait-dag
+        run: |
+          set -e
+
+          AIRFLOW_URL="${{ secrets.AIRFLOW_URL }}"
+          AIRFLOW_USERNAME="${{ secrets.AIRFLOW_USERNAME }}"
+          AIRFLOW_PASSWORD="${{ secrets.AIRFLOW_PASSWORD }}"
+          DAG_RUN_ID="${{ steps.trigger-dag.outputs.dag_run_id }}"
+
+          echo "⏳ Waiting for DAG run $DAG_RUN_ID to complete (timeout: ${{ env.AIRFLOW_TIMEOUT }}s)"
+
+          START_TIME=$(date +%s)
+          POLL_INTERVAL=5
+          SUCCESS=false
+
+          while true; do
+            ELAPSED=$(($(date +%s) - START_TIME))
+
+            if [ $ELAPSED -gt ${{ env.AIRFLOW_TIMEOUT }} ]; then
+              echo "::error::DAG execution timed out after $ELAPSED seconds"
+              exit 1
+            fi
+
+            # Get DAG run status
+            STATUS_RESPONSE=$(curl -s -X GET \
+              "$AIRFLOW_URL/api/v1/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns/$DAG_RUN_ID" \
+              -u "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD")
+
+            STATE=$(echo "$STATUS_RESPONSE" | grep -o '"state":"[^"]*"' | cut -d'"' -f4 || echo "")
+
+            if [ -z "$STATE" ]; then
+              echo "::error::Failed to get DAG run status"
+              echo "Response: $STATUS_RESPONSE"
+              exit 1
+            fi
+
+            echo "DAG state: $STATE (elapsed: ${ELAPSED}s)"
+
+            case "$STATE" in
+              success)
+                echo "✅ DAG completed successfully"
+                echo "state=success" >> $GITHUB_OUTPUT
+                SUCCESS=true
+                break
+                ;;
+              failed)
+                echo "::error::DAG execution failed"
+                echo "state=failed" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+              upstream_failed)
+                echo "::error::DAG execution failed (upstream task failed)"
+                echo "state=upstream_failed" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+              skipped)
+                echo "::notice::DAG was skipped"
+                echo "state=skipped" >> $GITHUB_OUTPUT
+                SUCCESS=true
+                break
+                ;;
+              running)
+                echo "Still running... (${ELAPSED}s elapsed)"
+                sleep $POLL_INTERVAL
+                ;;
+              *)
+                echo "Unknown state: $STATE"
+                sleep $POLL_INTERVAL
+                ;;
+            esac
+          done
+
+          if [ "$SUCCESS" = false ]; then
+            exit 1
+          fi
+
+      - name: Fetch DAG results from Airflow
+        if: steps.check-contracts.outputs.has_changes == 'true'
+        id: fetch-results
+        run: |
+          set -e
+
+          AIRFLOW_URL="${{ secrets.AIRFLOW_URL }}"
+          AIRFLOW_USERNAME="${{ secrets.AIRFLOW_USERNAME }}"
+          AIRFLOW_PASSWORD="${{ secrets.AIRFLOW_PASSWORD }}"
+          DAG_RUN_ID="${{ steps.trigger-dag.outputs.dag_run_id }}"
+
+          echo "📊 Fetching DAG execution results"
+
+          # Fetch the collect_and_format_results task result (contains comment body)
+          XCOM_RESPONSE=$(curl -s -X GET \
+            "$AIRFLOW_URL/api/v1/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns/$DAG_RUN_ID/taskInstances/collect_and_format_results/xcomEntries?key=github_payload" \
+            -u "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD")
+
+          echo "XCom Response: $XCOM_RESPONSE"
+
+          # Extract comment body (may be in value or stringified JSON)
+          COMMENT_BODY=$(echo "$XCOM_RESPONSE" | grep -o '"body":"[^"]*"' | cut -d'"' -f4 | sed 's/\\n/\n/g' || echo "")
+
+          if [ -z "$COMMENT_BODY" ]; then
+            echo "::warning::Could not extract comment body from XCom, using fallback message"
+            COMMENT_BODY="✅ Contract provisioning DAG completed successfully. Check Airflow UI for detailed results."
+          fi
+
+          # Save to file for next step (handle multiline)
+          echo "$COMMENT_BODY" > /tmp/comment_body.txt
+          echo "comment_body<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/comment_body.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "✅ Results fetched successfully"
+
+      - name: Comment on PR with results
+        if: steps.check-contracts.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const commentBody = `${{ steps.fetch-results.outputs.comment_body }}`;
+
+            if (!commentBody.trim()) {
+              core.warning('Comment body is empty, using minimal message');
+              const fallbackComment = `
+                ✅ Contract provisioning completed!
+
+                - DAG Run ID: ${{ steps.trigger-dag.outputs.dag_run_id }}
+                - View details in Airflow UI: ${{ secrets.AIRFLOW_URL }}/dags/${{ env.AIRFLOW_DAG_ID }}/runs
+              `;
+
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: fallbackComment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: commentBody
+              });
+            }
+
+            console.log('✅ Comment posted on PR #' + context.issue.number);
+
+      - name: Set PR status check
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const state = '${{ steps.wait-dag.outputs.state }}' === 'success' ? 'success' : 'failure';
+            const description = '${{ steps.wait-dag.outputs.state }}' === 'success'
+              ? 'Contract provisioning completed successfully'
+              : 'Contract provisioning failed - check Airflow logs';
+
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Contract Provisioning',
+              head_sha: context.sha,
+              status: 'completed',
+              conclusion: state,
+              output: {
+                title: 'Contract Provisioning via Airflow',
+                summary: description,
+                text: 'View detailed logs in Airflow UI: ${{ secrets.AIRFLOW_URL }}/dags/${{ env.AIRFLOW_DAG_ID }}/runs'
+              }
+            });
