@@ -46,6 +46,9 @@ services:
       # Disable random password generation - use the password set in entrypoint
       AIRFLOW__API_FASTAPI__SIMPLE_AUTH_MANAGER__GENERATE_PASSWORDS: "false"
 
+      # API authentication for v2 endpoints
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+
       # AWS Credentials
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}

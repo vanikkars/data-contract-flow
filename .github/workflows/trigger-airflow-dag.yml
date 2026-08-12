@@ -65,9 +65,9 @@ jobs:
 
           echo "🚀 Triggering Airflow DAG at $AIRFLOW_URL"
 
-          # Trigger DAG with GitHub context
+          # Trigger DAG with GitHub context (using API v2 for Airflow 3.x)
           RESPONSE=$(curl -s -X POST \
-            "$AIRFLOW_URL/api/v1/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns" \
+            "$AIRFLOW_URL/api/v2/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns" \
             -H "Content-Type: application/json" \
             -u "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD" \
             -d @- << EOF
@@ -118,9 +118,9 @@ jobs:
               exit 1
             fi
 
-            # Get DAG run status
+            # Get DAG run status (using API v2 for Airflow 3.x)
             STATUS_RESPONSE=$(curl -s -X GET \
-              "$AIRFLOW_URL/api/v1/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns/$DAG_RUN_ID" \
+              "$AIRFLOW_URL/api/v2/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns/$DAG_RUN_ID" \
               -u "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD")
 
             STATE=$(echo "$STATUS_RESPONSE" | grep -o '"state":"[^"]*"' | cut -d'"' -f4 || echo "")
@@ -185,8 +185,9 @@ jobs:
           echo "📊 Fetching DAG execution results"
 
           # Fetch the collect_and_format_results task result (contains comment body)
+          # Using API v2 for Airflow 3.x
           XCOM_RESPONSE=$(curl -s -X GET \
-            "$AIRFLOW_URL/api/v1/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns/$DAG_RUN_ID/taskInstances/collect_and_format_results/xcomEntries?key=github_payload" \
+            "$AIRFLOW_URL/api/v2/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns/$DAG_RUN_ID/taskInstances/collect_and_format_results/xcomEntries?key=github_payload" \
             -u "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD")
 
           echo "XCom Response: $XCOM_RESPONSE"
