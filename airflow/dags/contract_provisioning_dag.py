@@ -149,6 +149,7 @@ def task_register_schemas(**context):
     logger.info(f"📝 Registering {len(valid_contracts)} schemas")
 
     schema_results = []
+    failures = []
     for result in valid_contracts:
         contract_path = result["file_path"]
         try:
@@ -162,12 +163,18 @@ def task_register_schemas(**context):
                 "status": "failed",
                 "error": str(e),
             })
+            failures.append((contract_path, str(e)))
 
     # Push results to XCom
     ti.xcom_push(key="schema_results", value=schema_results)
 
     registered = sum(1 for r in schema_results if r.get("status") == "registered")
     logger.info(f"✅ Schema registration complete: {registered}/{len(schema_results)} registered")
+
+    # Fail the task if any registrations failed
+    if failures:
+        error_msg = "; ".join([f"{path}: {error}" for path, error in failures])
+        raise Exception(f"Schema registration failed for {len(failures)} contract(s): {error_msg}")
 
     return schema_results
 
@@ -191,6 +198,7 @@ def task_create_iceberg_tables(**context):
     logger.info(f"🗄️  Creating {len(valid_contracts)} Iceberg tables")
 
     table_results = []
+    failures = []
     for result in valid_contracts:
         contract_path = result["file_path"]
         try:
@@ -206,6 +214,7 @@ def task_create_iceberg_tables(**context):
                 "status": "failed",
                 "error": str(e),
             })
+            failures.append((contract_path, str(e)))
 
     # Push results to XCom
     ti.xcom_push(key="table_results", value=table_results)
@@ -216,6 +225,11 @@ def task_create_iceberg_tables(**context):
         f"✅ Table creation complete: {created} created, {updated} updated "
         f"({len(table_results)} total)"
     )
+
+    # Fail the task if any table creations failed
+    if failures:
+        error_msg = "; ".join([f"{path}: {error}" for path, error in failures])
+        raise Exception(f"Table creation failed for {len(failures)} contract(s): {error_msg}")
 
     return table_results
 
