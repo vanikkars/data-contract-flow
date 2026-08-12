@@ -174,12 +174,12 @@ validate-remote:
 	@read -p "Enter registry API URL: " url; \
 	python scripts/validate-contracts.py contracts/current/ --registry-url $$url
 
-# Bore Tunnel Commands
+# Bore Tunnel Commands (for GitHub Actions to reach local Airflow)
 bore-start:
-	@echo "🚀 Starting Bore Tunnels..."
+	@echo "🚀 Starting Bore Tunnel for Airflow (port 8080)..."
 	@./start-bore.sh
 
 bore-stop:
-	@echo "🛑 Stopping Bore Tunnels..."
-	@pkill -f "bore local" 2>/dev/null || echo "No bore tunnels running"
-	@echo "✅ Bore tunnels stopped"
+	@echo "🛑 Stopping Bore Tunnel..."
+	@pkill -f "bore local" 2>/dev/null || echo "No bore tunnel running"
+	@echo "✅ Bore tunnel stopped"
