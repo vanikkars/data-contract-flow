@@ -60,33 +60,36 @@ GitHub Actions
 ## Project Structure
 
 ```
-dags/
-├── contract_provisioning_dag.py    # Main DAG definition
-└── README.md                       # DAG documentation
-
-tasks/
-├── contract_tasks.py               # Contract validation & provisioning logic
-└── github_tasks.py                 # GitHub integration
-
-lib/
-├── aws_adapter.py                  # AWS Glue SDK wrapper
-└── contract_validator.py           # Schema validation
+airflow/
+├── dags/
+│   ├── contract_provisioning_dag.py    # Main DAG definition
+│   └── README.md                       # DAG documentation
+├── tasks/
+│   ├── contract_tasks.py               # Contract validation & provisioning logic
+│   └── github_tasks.py                 # GitHub integration
+├── lib/
+│   ├── aws_glue.py                     # AWS Glue SDK wrapper
+│   ├── models.py                       # Data models
+│   ├── validator.py                    # Schema validation
+│   ├── converters.py                   # Contract converters
+│   └── exceptions.py                   # Custom exceptions
+└── docker/
+    └── airflow-entrypoint.sh           # Airflow startup script
 
 contracts/
-├── current/                        # Active contracts (triggers DAG)
+├── current/                            # Active contracts (triggers DAG)
 │   ├── user/01/user.json
 │   ├── product/01/product.json
 │   └── ...
-└── all/                            # Historical contracts
+└── all/                                # Historical contracts
 
 scripts/
-├── validate-contracts.py           # Standalone validation tool
-└── setup-contract-automation.sh    # Setup script
+├── validate-contracts.py               # Standalone validation tool
+└── convert_to_avro.py                  # Contract to AVRO converter
 
 infra/
-├── aws/                            # Terraform for AWS resources
-├── docker/                         # Docker configuration
-└── README.md                       # Infrastructure docs
+├── aws/                                # Terraform for AWS resources
+└── README.md                           # Infrastructure docs
 ```
 
 ## Commands
@@ -453,22 +456,130 @@ make airflow-trigger
 
 ## CI/CD Integration
 
-### GitHub Actions
+### GitHub Actions Workflows
 
-When you push to `contracts/current/`:
+This project includes two automated workflows:
 
-1. GitHub Actions workflow triggers (`.github/workflows/trigger-airflow-dag.yml`)
-2. Sends HTTP POST to Airflow with PR number
-3. DAG runs contract provisioning
-4. Results posted as PR comment (when enabled)
+#### 1. **Trigger Airflow DAG** (`.github/workflows/trigger-airflow-dag.yml`)
+- **Trigger:** PR with changes to `contracts/current/**`
+- **Actions:** 
+  - Validates contracts with Airflow
+  - Registers schemas in AWS Glue
+  - Creates/updates Iceberg tables
+  - Comments PR with results
+- **Requires:** Airflow server + GitHub secrets
+
+#### 2. **Approve & Merge PR** (`.github/workflows/approve-merge.yml`)
+- **Trigger:** Comment `/approve-merge` on PR
+- **Actions:** Automatically squash-merges PR
+- **Who can use:** PR author, maintainers, admins
+
+### Setup GitHub Actions (Complete Guide)
+
+#### Step 1: Start Airflow Locally & Enable Remote Access
+
+```bash
+# 1. Start Airflow
+make airflow-up
+
+# 2. Open another terminal and start Bore tunnel for GitHub to reach your local Airflow
+make bore-start
+# Output will show: bore.pub forwarding http://... → localhost:8080
+
+# Keep this running while testing!
+```
+
+#### Step 2: Get Airflow Credentials
+
+```bash
+# Find Airflow admin password
+docker logs airflow-webserver | grep "Password for user"
+# Output: Password for user 'admin': xxxxxxxxxxx
+
+# Note down:
+# - Username: admin
+# - Password: xxxxxxxxxxx (from above)
+# - Airflow URL: http://your-bore-url (from Step 1)
+```
+
+#### Step 3: Add GitHub Secrets
+
+Go to **GitHub Repository → Settings → Secrets and variables → Actions**
+
+Add these **Repository Secrets:**
+
+| Secret Name | Value | Example |
+|------------|-------|---------|
+| `AIRFLOW_URL` | Your Bore tunnel URL | `http://abc123.bore.pub` |
+| `AIRFLOW_USERNAME` | Airflow admin user | `admin` |
+| `AIRFLOW_PASSWORD` | Airflow admin password | From Step 2 |
+
+**Steps to add:**
+1. Click **"New repository secret"**
+2. Name: `AIRFLOW_URL`
+3. Value: Paste your Bore tunnel URL
+4. Click **"Add secret"**
+5. Repeat for `AIRFLOW_USERNAME` and `AIRFLOW_PASSWORD`
+
+#### Step 4: Test the Workflow
+
+1. **Create a test PR with contract changes:**
+   ```bash
+   git checkout -b test-contract-pr
+   # Edit contracts/current/user/user_v1.json
+   git add contracts/current/
+   git commit -m "test: update contract for CI/CD test"
+   git push origin test-contract-pr
+   ```
+
+2. **Create Pull Request on GitHub**
+   - Go to your repository
+   - Click **"Compare & pull request"**
+   - Click **"Create pull request"**
+
+3. **Watch GitHub Actions**
+   - Go to **Actions** tab
+   - Click **"Trigger Airflow DAG for Contract Provisioning"**
+   - Watch the workflow run (should complete in ~2 min)
+   - See results commented on your PR
+
+4. **Approve and Merge (Optional)**
+   ```
+   Comment on PR: /approve-merge
+   ```
+   The PR will auto-merge!
+
+#### Step 5: Deploy Airflow (Production)
+
+When ready for production, deploy Airflow to a cloud provider:
+
+**Option A: AWS EC2**
+```bash
+# Deploy using Terraform (see infra/aws/README.md)
+cd infra/aws
+terraform apply
+```
+
+**Option B: Docker on Server**
+```bash
+# Deploy docker-compose to your server
+scp docker-compose.airflow.yml user@server:/opt/airflow/
+ssh user@server
+cd /opt/airflow
+docker-compose up -d
+```
+
+**Then update GitHub secrets:**
+- `AIRFLOW_URL` = `https://your-airflow-server.com` (not Bore URL anymore)
 
 ### Approval Workflow
 
-After DAG succeeds:
-1. Review Airflow logs
-2. Check GitHub PR comment
-3. Merge PR to approve contracts
-4. Contracts move from `current/` to `all/` for archival
+After DAG succeeds on PR:
+
+1. ✅ Check Airflow logs
+2. ✅ Review GitHub PR comment (shows validation results)
+3. ✅ Approve with comment: `/approve-merge`
+4. ✅ PR auto-merges, contracts go to production
 
 ## Requirements
 
@@ -481,10 +592,11 @@ After DAG succeeds:
 
 ## Documentation
 
-- [Airflow DAG Details](dags/README.md) — Complete DAG task documentation
+- [Airflow DAG Details](airflow/dags/README.md) — Complete DAG task documentation
 - [AWS Infrastructure](infra/aws/README.md) — Terraform setup
-- [Contract Schema](contracts/README.md) — Contract format and examples
-- [GitHub Actions Workflows](.github/workflows/trigger-airflow-dag.yml) — CI/CD integration
+- [GitHub Actions Workflows](.github/workflows/) — CI/CD integration
+  - `trigger-airflow-dag.yml` — Auto-triggers DAG on contract changes
+  - `approve-merge.yml` — Auto-merges PRs with `/approve-merge` comment
 
 ## Troubleshooting
 
@@ -507,7 +619,7 @@ docker-compose -f docker-compose.airflow.yml exec airflow-webserver \
 
 # Validate DAG syntax
 docker-compose -f docker-compose.airflow.yml exec airflow-webserver \
-  airflow dags validate dags/contract_provisioning_dag.py
+  airflow dags validate airflow/dags/contract_provisioning_dag.py
 ```
 
 ### AWS credential issues

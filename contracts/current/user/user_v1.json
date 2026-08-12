@@ -1,0 +1,34 @@
+{
+  "contract_id": "users-v1",
+  "name": "Users",
+  "description": "Schema for user records",
+  "version": "1.0.0",
+  "columns": [
+    {
+      "name": "user_name",
+      "data_type": "string",
+      "nullable": false,
+      "description": "Username for the user"
+    },
+    {
+      "name": "email",
+      "data_type": "string",
+      "nullable": false,
+      "description": "Email address of the user"
+    },
+    {
+      "name": "date_of_birth",
+      "data_type": "date",
+      "nullable": false,
+      "description": "Date of birth in YYYY-MM-DD format"
+    }
+  ],
+  "metadata": {
+    "data_owner": "User Management",
+    "data_owner_email": "user-mgmt@company.com",
+    "data_steward": "Data Engineering",
+    "data_steward_email": "data-engineering@company.com",
+    "sla_uptime_percentage": 99.95,
+    "sla_max_latency_ms": 5000
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "type": "record",
+  "name": "Users",
+  "namespace": "com.example.schema",
+  "doc": "Schema for user records\n\nMetadata:\n  Data Owner: User Management (user-mgmt@company.com)\n  Data Steward: Data Engineering (data-engineering@company.com)\n  SLA Uptime: 99.95%\n  SLA Max Latency: 5000ms",
+  "fields": [
+    {
+      "name": "user_name",
+      "type": "string",
+      "doc": "Username for the user"
+    },
+    {
+      "name": "email",
+      "type": "string",
+      "doc": "Email address of the user"
+    }
+  ]
+}

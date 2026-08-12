@@ -37,6 +37,38 @@ echo "        --username admin --password admin --role Admin \\"
 echo "        --firstname Admin --lastname User --email admin@example.com"
 echo ""
 
+# Create default admin user for Airflow 2.11
+echo "👤 Creating admin user..."
+airflow users create \
+  --username admin \
+  --firstname Admin \
+  --lastname User \
+  --role Admin \
+  --email admin@example.com \
+  --password admin \
+  2>/dev/null || echo "ℹ️  Admin user already exists"
+
+echo ""
+echo "✅ Airflow is ready!"
+echo "📊 Access at: http://localhost:8080"
+echo "👤 Login with: admin / admin"
+echo ""
+
 # Start Airflow webserver and scheduler
 echo "🚀 Starting Airflow webserver and scheduler..."
-exec airflow standalone
+
+# Start webserver in background
+airflow webserver --port 8080 &
+WEBSERVER_PID=$!
+echo "Webserver started with PID: $WEBSERVER_PID"
+
+# Give webserver time to start
+sleep 5
+
+# Start scheduler in background
+airflow scheduler &
+SCHEDULER_PID=$!
+echo "Scheduler started with PID: $SCHEDULER_PID"
+
+# Wait for both processes
+wait
