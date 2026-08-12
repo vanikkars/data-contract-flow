@@ -218,39 +218,39 @@ jobs:
           cat /tmp/comment_body.txt >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+          # Save DAG run URL for later use
+          DAG_RUN_URL="$AIRFLOW_URL/dags/${{ env.AIRFLOW_DAG_ID }}/runs/$DAG_RUN_ID"
+          echo "dag_run_url=$DAG_RUN_URL" >> $GITHUB_OUTPUT
+
           echo "✅ Results fetched successfully"
 
       - name: Comment on PR with results
         if: steps.check-contracts.outputs.has_changes == 'true'
         uses: actions/github-script@v7
+        env:
+          COMMENT_BODY: ${{ steps.fetch-results.outputs.comment_body }}
+          DAG_RUN_URL: ${{ steps.fetch-results.outputs.dag_run_url }}
+          DAG_RUN_ID: ${{ steps.trigger-dag.outputs.dag_run_id }}
         with:
           script: |
-            const fs = require('fs');
-            const commentBody = `${{ steps.fetch-results.outputs.comment_body }}`;
+            const commentBody = process.env.COMMENT_BODY || '';
+            const dagRunUrl = process.env.DAG_RUN_URL || '';
+            const dagRunId = process.env.DAG_RUN_ID || '';
 
+            let finalComment;
             if (!commentBody.trim()) {
               core.warning('Comment body is empty, using minimal message');
-              const fallbackComment = `
-                ✅ Contract provisioning completed!
-
-                - DAG Run ID: ${{ steps.trigger-dag.outputs.dag_run_id }}
-                - View details in Airflow UI: ${{ secrets.AIRFLOW_URL }}/dags/${{ env.AIRFLOW_DAG_ID }}/runs
-              `;
-
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: fallbackComment
-              });
+              finalComment = `## ✅ Contract Provisioning Completed\n\n**DAG Run ID:** \`${dagRunId}\`\n\n**View Details:**\n- [📊 Airflow DAG Run](${dagRunUrl})\n\n---\n*Contract provisioning completed successfully. Check the Airflow UI for detailed logs and execution results.*`;
             } else {
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: commentBody
-              });
+              finalComment = `## ✅ Contract Provisioning Results\n\n${commentBody}\n\n---\n**Additional Information:**\n- **DAG Run ID:** \`${dagRunId}\`\n- **View Full Details:** [📊 Airflow DAG Run](${dagRunUrl})`;
             }
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: finalComment
+            });
 
             console.log('✅ Comment posted on PR #' + context.issue.number);
 
