@@ -204,22 +204,7 @@ jobs:
           echo "XCom Response: $XCOM_RESPONSE"
 
           # Extract comment body using Python JSON parsing
-          COMMENT_BODY=$(echo "$XCOM_RESPONSE" | python3 << 'PYTHON_EOF'
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    if isinstance(data, list) and len(data) > 0:
-        value = data[0].get('value', {})
-        if isinstance(value, dict):
-            print(value.get('body', ''))
-        else:
-            print(str(value))
-    else:
-        print('')
-except:
-    print('')
-PYTHON_EOF
-          )
+          COMMENT_BODY=$(echo "$XCOM_RESPONSE" | python3 -c "import sys, json; data = json.load(sys.stdin); value = data[0].get('value', {}) if isinstance(data, list) and len(data) > 0 else {}; print(value.get('body', '') if isinstance(value, dict) else str(value) if value else '')" 2>/dev/null || echo "")
 
           if [ -z "$COMMENT_BODY" ]; then
             echo "::warning::Could not extract comment body from XCom, using fallback message"
