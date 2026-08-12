@@ -53,7 +53,7 @@ dag = DAG(
     "contract_provisioning",
     default_args=default_args,
     description="Validate, register, and provision contracts as schemas and Iceberg tables",
-    schedule_interval=None,  # Manual or webhook triggered
+    schedule=None,  # Manual or webhook triggered
     catchup=False,
     tags=["contracts", "provisioning", "glue", "iceberg"],
     is_paused_upon_creation=False,

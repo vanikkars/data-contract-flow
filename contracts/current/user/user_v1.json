@@ -1,8 +1,8 @@
 {
   "contract_id": "users-v1",
   "name": "Users",
-  "description": "Schema for user records (v2 with profile fields)",
-  "version": "2.0.0",
+  "description": "Schema for user records",
+  "version": "1.0.0",
   "columns": [
     {
       "name": "user_name",
@@ -21,18 +21,6 @@
       "data_type": "date",
       "nullable": false,
       "description": "Date of birth in YYYY-MM-DD format"
-    },
-    {
-      "name": "zip_code",
-      "data_type": "string",
-      "nullable": true,
-      "description": "Zip code of the user (added in v2, optional for backwards compatibility)"
-    },
-    {
-      "name": "last_login_at",
-      "data_type": "timestamp",
-      "nullable": true,
-      "description": "Timestamp of last login (added in v2, optional for backwards compatibility)"
     }
   ],
   "metadata": {

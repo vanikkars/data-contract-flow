@@ -23,7 +23,7 @@ services:
       - "app=airflow-postgres"
 
   airflow:
-    image: apache/airflow:2.8.0-python3.11
+    image: apache/airflow:3.3.0-python3.11
     container_name: airflow-webserver
     depends_on:
       postgres:
@@ -40,6 +40,9 @@ services:
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
       AIRFLOW__WEBSERVER__SECRET_KEY: "change-me-in-production"
       AIRFLOW__LOGGING__LOGGING_LEVEL: "INFO"
+
+      # Disable random password generation - use the password set in entrypoint
+      AIRFLOW__API_FASTAPI__SIMPLE_AUTH_MANAGER__GENERATE_PASSWORDS: "false"
 
       # AWS Credentials
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
@@ -59,12 +62,12 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./dags:/usr/local/airflow/dags
-      - ./tasks:/usr/local/airflow/tasks
-      - ./lib:/usr/local/airflow/lib
+      - ./airflow/dags:/usr/local/airflow/dags
+      - ./airflow/tasks:/usr/local/airflow/tasks
+      - ./airflow/lib:/usr/local/airflow/lib
       - ./contracts:/app/contracts:ro
       - airflow_logs:/usr/local/airflow/logs
-      - ./docker/airflow-entrypoint.sh:/entrypoint.sh
+      - ./airflow/docker/airflow-entrypoint.sh:/entrypoint.sh
     entrypoint: /entrypoint.sh
     env_file:
       - .env
@@ -72,7 +75,7 @@ services:
       - airflow-net
     labels:
       - "app=airflow-webserver"
-      - "version=2.8.0"
+      - "version=3.3.0"
     restart: unless-stopped
 
 networks:

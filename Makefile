@@ -1,38 +1,15 @@
-.PHONY: help docker-build docker-up docker-down docker-logs docker-shell docker-dev docker-dev-down docker-clean test validate-contracts validate-all bore-start bore-stop
+.PHONY: help airflow-up airflow-down airflow-logs airflow-ui airflow-trigger validate-contracts validate-contracts-all bore-start bore-stop
 
 help:
-	@echo "Schema Registry - Make Commands"
-	@echo "================================"
+	@echo "Airflow DAG - Contract Provisioning"
+	@echo "===================================="
 	@echo ""
-	@echo "Docker Commands:"
-	@echo "  make docker-build    - Build Docker image"
-	@echo "  make docker-up       - Start services (production)"
-	@echo "  make docker-down     - Stop services"
-	@echo "  make docker-logs     - View service logs"
-	@echo "  make docker-shell    - Open shell in container"
-	@echo "  make docker-ps       - Show running containers"
-	@echo "  make docker-clean    - Clean up Docker resources"
-	@echo ""
-	@echo "Development Commands:"
-	@echo "  make docker-dev      - Start development services (with postgres, redis)"
-	@echo "  make docker-dev-down - Stop development services"
-	@echo ""
-	@echo "Tunnel Commands (GitHub Actions Integration):"
-	@echo "  make bore-start    - Start Bore Tunnels (instant, no setup)"
-	@echo "  make bore-stop     - Stop Bore Tunnels"
-	@echo ""
-	@echo "Local Commands:"
-	@echo "  make setup           - Setup local environment"
-	@echo "  make run-api         - Run API locally"
-	@echo "  make generate        - Generate contracts"
-	@echo "  make test            - Run tests"
-	@echo ""
-	@echo "Schema Commands:"
-	@echo "  make upload-contract        - Upload a contract (prompts for file)"
-	@echo "  make upload-user-contract   - Upload user contract"
-	@echo "  make list-schemas           - List all schemas in registry"
-	@echo "  make schema-detail          - Get schema details (use SCHEMA_NAME=<name>)"
-	@echo "  make health                 - Check API health"
+	@echo "Airflow Commands:"
+	@echo "  make airflow-up      - Start Airflow services (docker-compose.airflow.yml)"
+	@echo "  make airflow-down    - Stop Airflow services"
+	@echo "  make airflow-logs    - View Airflow logs"
+	@echo "  make airflow-ui      - Open Airflow UI (http://localhost:8080)"
+	@echo "  make airflow-trigger - Trigger contract_provisioning DAG manually"
 	@echo ""
 	@echo "Validation Commands (Contract Automation):"
 	@echo "  make validate-contracts     - Validate current contracts (contracts/current/)"
@@ -41,70 +18,83 @@ help:
 	@echo "  make validate-export-all    - Validate all and export results"
 	@echo "  make validate-remote        - Validate current contracts against remote API"
 	@echo ""
+	@echo "Tunnel Commands (GitHub Actions Integration):"
+	@echo "  make bore-start    - Start Bore Tunnels (instant, no setup)"
+	@echo "  make bore-stop     - Stop Bore Tunnels"
+	@echo ""
 
-# Docker Production Commands
-docker-build:
-	docker-compose build
+# Airflow Commands (Contract Provisioning Orchestration)
+airflow-up:
+	docker-compose -f docker-compose.airflow.yml up
+	@echo "✅ Airflow services started"
+	@echo "📊 Airflow UI: http://localhost:8080"
+	@echo "   Default credentials: airflow / airflow"
+	@echo "   DAG: contract_provisioning"
 
-docker-up-build:
-	docker-compose up --build
+airflow-up-build:
+	docker-compose -f docker-compose.airflow.yml up --build
+	@echo "✅ Airflow services started"
+	@echo "📊 Airflow UI: http://localhost:8080"
+	@echo "   Default credentials: airflow / airflow"
+	@echo "   DAG: contract_provisioning"
 
-docker-up:
-	docker-compose up
-	@echo "✅ Services started"
-	@echo "📍 API: http://localhost:8000"
-	@echo "📖 Docs: http://localhost:8000/docs"
+airflow-down:
+	docker-compose -f docker-compose.airflow.yml down
+	@echo "✅ Airflow services stopped"
 
-docker-down:
-	docker-compose down
-	@echo "✅ Services stopped"
+airflow-clean:
+	@echo "🧹 Cleaning up Airflow (removing volumes and data)..."
+	docker-compose -f docker-compose.airflow.yml down -v
+	@echo "✅ Airflow cleaned up. Run 'make airflow-up' to start fresh"
 
-docker-logs:
-	docker-compose logs -f registry_api
+airflow-reset:
+	@echo "🔄 Resetting Airflow (full clean restart)..."
+	docker-compose -f docker-compose.airflow.yml down -v
+	docker-compose -f docker-compose.airflow.yml up -d
+	@echo "⏳ Waiting for Airflow to initialize..."
+	@sleep 15
+	@echo "✅ Airflow reset complete!"
+	@echo "📊 Access at: http://localhost:8080"
+	@echo "👤 Login with: admin / admin"
+	@echo "🔑 If you get 401 error, run: make airflow-get-password"
 
-docker-shell:
-	docker-compose exec registry_api /bin/bash
+airflow-get-password:
+	@echo "🔑 Airflow Admin Password:"
+	@echo "================================"
+	@docker logs airflow-webserver 2>&1 | grep "Password for user" | tail -1 || echo "❌ Password not found. Is Airflow running?"
 
-docker-ps:
-	docker-compose ps
+airflow-clean:
+	docker-compose -f docker-compose.airflow.yml down -v
+	@echo "✅ Airflow services stopped, the volumes are deleted"
 
-docker-clean:
-	docker-compose down -v
-	docker system prune -f
-	@echo "✅ Docker cleaned"
+airflow-logs:
+	docker-compose -f docker-compose.airflow.yml logs -f
 
-# Development Commands
-docker-dev:
-	docker-compose -f docker-compose.dev.yml up -d
-	@echo "✅ Development services started"
-	@echo "📍 API: http://localhost:8000"
-	@echo "📖 Docs: http://localhost:8000/docs"
-	@echo "🗄️  PostgreSQL: localhost:5432"
-	@echo "💾 Redis: localhost:6379"
+airflow-ui:
+	@echo "Opening Airflow UI..."
+	@open http://localhost:8080 || echo "Visit: http://localhost:8080"
 
-docker-dev-down:
-	docker-compose -f docker-compose.dev.yml down
-	@echo "✅ Development services stopped"
-
-docker-dev-logs:
-	docker-compose -f docker-compose.dev.yml logs -f
+airflow-trigger:
+	@echo "Triggering contract_provisioning DAG..."
+	@curl -X POST http://localhost:8080/api/v1/dags/contract_provisioning/dagRuns \
+		-H "Content-Type: application/json" \
+		-u airflow:airflow \
+		-d '{"conf": {}}'
+	@echo "✅ DAG triggered. Check Airflow UI at http://localhost:8080"
 
 # Local Commands
 setup:
 	source .env
 	@echo "✅ Environment loaded"
 
-run-api:
-	source .env
-	bash registry_api/run.sh
-
 generate:
 	@echo "❌ Contract generation moved to static contracts/ folder"
 	@echo "   Add or modify contracts in: contracts/"
 
 test:
-	source .env
-	docker-compose exec registry_api pytest tests/ -v
+	@echo "⚠️  Test command requires registry_api container"
+	@echo "   Run: make airflow-up (to start Airflow services)"
+	@echo "   Then: docker-compose -f docker-compose.airflow.yml exec airflow-webserver pytest tests/ -v"
 
 
 tf-init:
@@ -142,37 +132,15 @@ check-aws:
 
 # Info Commands
 info:
-	@echo "Schema Registry Project Info"
-	@echo "============================"
-	@docker-compose ps
+	@echo "Airflow Project Info"
+	@echo "==================="
+	docker-compose -f docker-compose.airflow.yml ps
 	@echo ""
 	@echo "Recent Images:"
-	@docker images | grep schema-registry || echo "No images found"
+	@docker images | grep airflow || echo "No Airflow images found"
 
 version:
-	@grep -E "version|VERSION" docker-compose.yml | head -1
-
-# Useful Shortcuts
-list-endpoints:
-	@echo "API Endpoints:"
-	@echo "=============="
-	@curl -s http://localhost:8000/docs | grep -o '"operationId":"[^"]*"' | cut -d'"' -f4 || echo "API not running. Run: make docker-up"
-
-health:
-	@curl -s http://localhost:8000/health || echo "❌ API not responding"
-
-upload-contract:
-	bash contracts_management/upload_contract.sh
-
-upload-user-contract:
-	bash contracts_management/upload_contract.sh contracts/user_contract.json
-
-list-schemas:
-	bash contracts_management/list_schemas.sh
-
-schema-detail:
-	@echo "Usage: make schema-detail SCHEMA_NAME=<name>"
-	@curl -s "http://localhost:8000/api/v1/schemas/detail/$${SCHEMA_NAME}" | jq .
+	@grep -E "version|image" docker-compose.airflow.yml | head -5
 
 list-all-commands:
 	@echo "All available targets:"
