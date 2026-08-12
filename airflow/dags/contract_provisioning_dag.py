@@ -73,8 +73,18 @@ def task_fetch_contracts(**context):
 
     repo_path = Variable.get("repo_path", "/app")
     contracts_dir = Variable.get("contracts_dir", "contracts/current")
+    changed_files = Variable.get("changed_files", None)
+    process_all = Variable.get("process_all", False)
 
-    contract_files = ContractTasks.fetch_contract_files(repo_path, contracts_dir)
+    # Parse changed_files if it's a space-separated string
+    if changed_files and isinstance(changed_files, str):
+        changed_files = changed_files.split()
+
+    # Parse process_all if it's a string
+    if isinstance(process_all, str):
+        process_all = process_all.lower() in ('true', '1', 'yes')
+
+    contract_files = ContractTasks.fetch_contract_files(repo_path, contracts_dir, changed_files, process_all)
 
     if not contract_files:
         logger.warning("⚠️  No contract files found")

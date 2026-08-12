@@ -6,6 +6,16 @@ on:
       - 'contracts/current/**'
       - '.github/workflows/trigger-airflow-dag.yml'
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      process_all:
+        description: 'Process all contracts instead of just changed ones'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   pull-requests: write
@@ -41,12 +51,21 @@ jobs:
       - name: Check if contracts changed
         id: check-contracts
         run: |
-          if [ -z "${{ steps.changed-files.outputs.files }}" ]; then
-            echo "::notice::No contract files changed, skipping DAG trigger"
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-          else
+          PROCESS_ALL="${{ github.event.inputs.process_all }}"
+          CHANGED_FILES="${{ steps.changed-files.outputs.files }}"
+
+          # If process_all flag is set (manual trigger), always proceed
+          if [ "$PROCESS_ALL" = "true" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "📋 process_all=true, will process all contracts"
+          # If changed files exist, proceed
+          elif [ -n "$CHANGED_FILES" ]; then
             echo "has_changes=true" >> $GITHUB_OUTPUT
             echo "📋 Found changed contracts, will trigger Airflow DAG"
+          # Otherwise skip
+          else
+            echo "::notice::No contract files changed and process_all not set, skipping DAG trigger"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Trigger Airflow DAG
@@ -66,6 +85,12 @@ jobs:
 
           echo "🚀 Triggering Airflow DAG at $AIRFLOW_URL"
 
+          # Determine process_all flag (true if workflow_dispatch with process_all=true, false otherwise)
+          PROCESS_ALL="${{ github.event.inputs.process_all }}"
+          if [ -z "$PROCESS_ALL" ]; then
+            PROCESS_ALL="false"
+          fi
+
           # Trigger DAG with GitHub context (using API v1 for Airflow 2.11)
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$AIRFLOW_URL/api/v1/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns" \
@@ -76,7 +101,9 @@ jobs:
             "conf": {
               "github_pr_number": ${{ github.event.pull_request.number }},
               "github_repo": "${{ github.repository }}",
-              "github_token": "${{ secrets.GITHUB_TOKEN }}"
+              "github_token": "${{ secrets.GITHUB_TOKEN }}",
+              "changed_files": "${{ steps.changed-files.outputs.files }}",
+              "process_all": "$PROCESS_ALL"
             }
           }
           EOF
