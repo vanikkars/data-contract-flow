@@ -2,7 +2,7 @@
   "contract_id": "users-v1",
   "name": "Users",
   "description": "Schema for user records",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "columns": [
     {
       "name": "user_name",
