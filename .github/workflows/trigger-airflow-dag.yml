@@ -66,7 +66,7 @@ jobs:
           echo "🚀 Triggering Airflow DAG at $AIRFLOW_URL"
 
           # Trigger DAG with GitHub context (using API v1 for Airflow 2.11)
-          RESPONSE=$(curl -s -X POST \
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$AIRFLOW_URL/api/v1/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns" \
             -H "Content-Type: application/json" \
             -u "$AIRFLOW_USERNAME:$AIRFLOW_PASSWORD" \
@@ -81,12 +81,23 @@ jobs:
           EOF
           )
 
-          # Extract DAG run ID
-          DAG_RUN_ID=$(echo "$RESPONSE" | grep -o '"dag_run_id":"[^"]*"' | cut -d'"' -f4 || echo "")
+          # Extract HTTP status code (last line)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+
+          # Check if request succeeded (status 200)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Failed to trigger DAG (HTTP $HTTP_CODE)"
+            echo "Response: $RESPONSE_BODY"
+            exit 1
+          fi
+
+          # Extract DAG run ID using Python for reliable JSON parsing
+          DAG_RUN_ID=$(echo "$RESPONSE_BODY" | python3 -c "import sys, json; print(json.load(sys.stdin).get('dag_run_id', ''))" 2>/dev/null || echo "")
 
           if [ -z "$DAG_RUN_ID" ]; then
-            echo "::error::Failed to trigger DAG"
-            echo "Response: $RESPONSE"
+            echo "::error::Failed to extract DAG run ID from response"
+            echo "Response: $RESPONSE_BODY"
             exit 1
           fi
 
