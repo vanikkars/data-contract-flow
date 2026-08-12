@@ -34,9 +34,11 @@ services:
       AIRFLOW__CORE__BASE_LOG_FOLDER: /usr/local/airflow/logs
       AIRFLOW__CORE__PLUGINS_FOLDER: /usr/local/airflow/plugins
       AIRFLOW__DATABASE__SQLALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__UNIT_TEST_MODE: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
       AIRFLOW__WEBSERVER__SECRET_KEY: "change-me-in-production"
       AIRFLOW__WEBSERVER__WEB_SERVER_HOST: "0.0.0.0"
