@@ -17,12 +17,17 @@ Triggered by:
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import logging
+import sys
+from pathlib import Path
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.python import get_current_context
 from airflow.models import Variable
 from airflow.utils.task_group import TaskGroup
+
+# Add parent directory to path so we can import tasks
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from tasks.contract_tasks import ContractTasks
 from tasks.github_tasks import GitHubTasks
