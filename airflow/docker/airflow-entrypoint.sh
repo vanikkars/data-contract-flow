@@ -54,15 +54,6 @@ echo "📊 Access at: http://localhost:8080"
 echo "👤 Login with: admin / admin"
 echo ""
 
-# Start Airflow webserver and scheduler
-echo "🚀 Starting Airflow webserver and scheduler..."
-airflow webserver --port 8080 &
-WEBSERVER_PID=$!
-
-sleep 5
-
-airflow scheduler &
-SCHEDULER_PID=$!
-
-# Wait for processes
-wait
+# Start Airflow webserver only (scheduler requires different executor config)
+echo "🚀 Starting Airflow webserver..."
+airflow webserver --port 8080
