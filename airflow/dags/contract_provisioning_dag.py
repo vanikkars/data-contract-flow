@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import logging
 import sys
+import asyncio
 from pathlib import Path
 
 from airflow import DAG
@@ -202,9 +203,8 @@ def task_create_iceberg_tables(**context):
     for result in valid_contracts:
         contract_path = result["file_path"]
         try:
-            # Note: This task runs synchronously, but the function is async-ready
-            # In production, use AsyncPythonOperator or separate async handling
-            table_result = ContractTasks.create_iceberg_table.__wrapped__(contract_path)
+            # Run async function in event loop
+            table_result = asyncio.run(ContractTasks.create_iceberg_table(contract_path))
             table_results.append(table_result)
         except Exception as e:
             logger.error(f"❌ Table creation failed for {contract_path}: {str(e)}")
