@@ -23,7 +23,7 @@ services:
       - "app=airflow-postgres"
 
   airflow:
-    image: apache/airflow:3.3.0-python3.11
+    image: apache/airflow:2.11.0-python3.11
     container_name: airflow-webserver
     depends_on:
       postgres:
@@ -43,13 +43,9 @@ services:
       AIRFLOW__WEBSERVER__WEB_SERVER_PORT: "8080"
       AIRFLOW__LOGGING__LOGGING_LEVEL: "INFO"
 
-      # Disable random password generation - use the password set in entrypoint
-      AIRFLOW__API_FASTAPI__SIMPLE_AUTH_MANAGER__GENERATE_PASSWORDS: "false"
-
-      # Configure API auth to allow unauthenticated access
-      # WARNING: Only for local/dev. Requires auth in production.
-      # Use "airflow.api.auth.backend.default" to enable authentication
-      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.default"
+      # API Authentication for Airflow 2.11
+      # Uses Flask-AppBuilder auth which supports basic auth
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
 
       # AWS Credentials
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
