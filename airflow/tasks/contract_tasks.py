@@ -18,12 +18,14 @@ class ContractTasks:
     """Collection of Airflow tasks for contract processing."""
 
     @staticmethod
-    def fetch_contract_files(repo_path: str = "/app", contracts_dir: str = "contracts/current") -> List[str]:
-        """Fetch changed contract files from the repository.
+    def fetch_contract_files(repo_path: str = "/app", contracts_dir: str = "contracts/current", changed_files: List[str] = None, process_all: bool = False) -> List[str]:
+        """Fetch contract files from the repository.
 
         Args:
             repo_path: Base repository path
             contracts_dir: Relative path to contracts directory
+            changed_files: List of changed file paths (if provided and process_all=False, only these files are processed)
+            process_all: If True, process all contracts regardless of changed_files
 
         Returns:
             List of contract file paths
@@ -34,10 +36,24 @@ class ContractTasks:
             logger.warning(f"Contracts directory not found: {contracts_path}")
             return []
 
-        contract_files = sorted(contracts_path.glob("**/*.json"))
-        logger.info(f"Found {len(contract_files)} contract files")
+        if process_all:
+            # Process all contracts
+            contract_files = sorted([str(f) for f in contracts_path.glob("**/*.json")])
+            logger.info(f"Processing ALL {len(contract_files)} contract files (process_all=true)")
+        elif changed_files:
+            # Filter to only .json files in contracts directory
+            contract_files = [
+                str(Path(repo_path) / f)
+                for f in changed_files
+                if f.endswith('.json') and f.startswith(contracts_dir)
+            ]
+            logger.info(f"Processing {len(contract_files)} changed contract files")
+        else:
+            # No changed files and no process_all flag - process nothing
+            contract_files = []
+            logger.info("No changed files and process_all not set, processing zero contracts")
 
-        return [str(f) for f in contract_files]
+        return contract_files
 
     @staticmethod
     def validate_contract(contract_path: str) -> Dict[str, Any]:
