@@ -1,13 +1,18 @@
 """Airflow DAG for contract validation, schema registration, and Iceberg table provisioning.
 
-This DAG replaces two separate microservices (Registry API and Iceberg Service) by orchestrating
-all operations using Airflow tasks. It:
+This DAG uses dynamic task mapping with task groups to achieve true per-contract isolation:
+- Each contract gets its own task instance through the entire pipeline
+- Failures in one contract don't block others
+- Airflow UI shows clear per-contract visibility
 
-1. Fetches contract files from the repository
-2. Validates each contract
-3. Registers schemas with AWS Glue Schema Registry
-4. Creates/updates Iceberg tables in AWS Glue Catalog
-5. Reports results to GitHub PR
+Pipeline:
+1. Fetch contract files from repository
+2. For each contract (dynamic tasks):
+   - Validate the contract
+   - Register schema in AWS Glue
+   - Create/update Iceberg table
+3. Aggregate results from all contracts
+4. Report to GitHub PR
 
 Triggered by:
 - GitHub Actions webhook (when contracts/current/** changes)
@@ -18,12 +23,10 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import logging
 import sys
-import asyncio
 from pathlib import Path
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.python import get_current_context
 from airflow.models import Variable
 from airflow.utils.task_group import TaskGroup
 
@@ -53,14 +56,11 @@ default_args = {
 dag = DAG(
     "contract_provisioning",
     default_args=default_args,
-    description="Validate, register, and provision contracts as schemas and Iceberg tables",
+    description="Validate, register, and provision contracts as schemas and Iceberg tables (per-contract isolation)",
     schedule_interval=None,  # Manual or webhook triggered
     catchup=False,
     tags=["contracts", "provisioning", "glue", "iceberg"],
     is_paused_upon_creation=False,
-    user_defined_macros={
-        "now": datetime.now(),
-    },
 )
 
 # ============================================================================
@@ -68,7 +68,10 @@ dag = DAG(
 # ============================================================================
 
 def task_fetch_contracts(**context):
-    """Fetch contract files from repository."""
+    """Fetch contract files from repository.
+
+    Returns list of contract file paths for dynamic task expansion.
+    """
     logger.info("🔍 Starting contract provisioning DAG")
 
     repo_path = Variable.get("repo_path", "/app")
@@ -88,182 +91,120 @@ def task_fetch_contracts(**context):
 
     if not contract_files:
         logger.warning("⚠️  No contract files found")
-        return {"contracts": [], "count": 0}
+        return []
 
     logger.info(f"📋 Found {len(contract_files)} contract files")
-
-    # Push to XCom for downstream tasks
-    context["task_instance"].xcom_push(key="contract_files", value=contract_files)
-
-    return {
-        "contracts": contract_files,
-        "count": len(contract_files),
-    }
+    return contract_files
 
 
-def task_validate_contracts(**context):
-    """Validate each contract file."""
-    ti = context["task_instance"]
+def task_validate_contract(contract_path: str, **context):
+    """Validate a single contract file.
 
-    # Get contract files from upstream task
-    contract_files = ti.xcom_pull(
-        task_ids="fetch_contracts",
-        key="contract_files"
-    )
+    This task runs once per contract (via dynamic expansion).
 
-    if not contract_files:
-        logger.info("No contracts to validate")
-        return []
+    Args:
+        contract_path: Path to the contract file
 
-    logger.info(f"✓ Validating {len(contract_files)} contracts")
+    Returns:
+        Dict with validation result
 
-    validation_results = []
-    for contract_path in contract_files:
-        try:
-            result = ContractTasks.validate_contract(contract_path)
-            result["status"] = "valid"
-            validation_results.append(result)
-        except ValueError as e:
-            logger.error(f"❌ Validation failed for {contract_path}: {str(e)}")
-            validation_results.append({
-                "file_path": contract_path,
-                "status": "invalid",
-                "error": str(e),
-            })
-
-    # Push results to XCom
-    ti.xcom_push(key="validation_results", value=validation_results)
-
-    passed = sum(1 for r in validation_results if r["status"] == "valid")
-    logger.info(f"✅ Validation complete: {passed}/{len(validation_results)} passed")
-
-    return validation_results
+    Raises:
+        ValueError: If validation fails (task will fail for this contract only)
+    """
+    try:
+        result = ContractTasks.validate_contract(contract_path)
+        result["file_path"] = contract_path
+        result["status"] = "valid"
+        logger.info(f"✅ Validated {result.get('contract_id', contract_path)}")
+        return result
+    except ValueError as e:
+        logger.error(f"❌ Validation failed for {contract_path}: {str(e)}")
+        raise
 
 
-def task_register_schemas(**context):
-    """Register validated contracts as schemas in AWS Glue Schema Registry."""
-    ti = context["task_instance"]
+def task_register_schema(validation_result: Dict[str, Any], **context):
+    """Register a validated contract as AVRO schema in AWS Glue.
 
-    # Get validation results
-    validation_results = ti.xcom_pull(
-        task_ids="validate_contracts",
-        key="validation_results"
-    )
+    This task runs once per contract after validation succeeds.
 
-    if not validation_results:
-        logger.info("No valid contracts to register")
-        return []
+    Args:
+        validation_result: Result from validate_contract task
 
-    # Only process valid contracts
-    valid_contracts = [r for r in validation_results if r["status"] == "valid"]
+    Returns:
+        Dict with registration result
 
-    logger.info(f"📝 Registering {len(valid_contracts)} schemas")
+    Raises:
+        Exception: If registration fails (task will fail for this contract only)
+    """
+    contract_path = validation_result["file_path"]
+    contract_id = validation_result.get("contract_id", "unknown")
 
-    schema_results = []
-    failures = []
-    for result in valid_contracts:
-        contract_path = result["file_path"]
-        try:
-            schema_result = ContractTasks.register_schema(contract_path)
-            schema_results.append(schema_result)
-        except Exception as e:
-            logger.error(f"❌ Schema registration failed for {contract_path}: {str(e)}")
-            schema_results.append({
-                "file_path": contract_path,
-                "contract_id": result.get("contract_id", "unknown"),
-                "status": "failed",
-                "error": str(e),
-            })
-            failures.append((contract_path, str(e)))
-
-    # Push results to XCom
-    ti.xcom_push(key="schema_results", value=schema_results)
-
-    registered = sum(1 for r in schema_results if r.get("status") == "registered")
-    logger.info(f"✅ Schema registration complete: {registered}/{len(schema_results)} registered")
-
-    # Fail the task if any registrations failed
-    if failures:
-        error_msg = "; ".join([f"{path}: {error}" for path, error in failures])
-        raise Exception(f"Schema registration failed for {len(failures)} contract(s): {error_msg}")
-
-    return schema_results
+    try:
+        schema_result = ContractTasks.register_schema(contract_path)
+        logger.info(f"✅ Registered schema for {contract_id}")
+        return schema_result
+    except Exception as e:
+        logger.error(f"❌ Schema registration failed for {contract_id}: {str(e)}")
+        raise
 
 
-def task_create_iceberg_tables(**context):
-    """Create Iceberg tables from registered schemas.
+def task_create_table(validation_result: Dict[str, Any], **context):
+    """Create/update Iceberg table from validated contract schema.
 
-    This task only runs after register_schemas succeeds, ensuring all schemas exist.
+    This task runs once per contract after validation succeeds.
+    Runs independently of schema registration (both start after validation).
+
+    Args:
+        validation_result: Result from validate_contract task
+
+    Returns:
+        Dict with table creation result
+
+    Raises:
+        Exception: If table creation fails (task will fail for this contract only)
+    """
+    contract_path = validation_result["file_path"]
+    contract_id = validation_result.get("contract_id", "unknown")
+
+    try:
+        table_result = ContractTasks.create_iceberg_table(contract_path)
+        logger.info(f"✅ Created/updated table for {contract_id}")
+        return table_result
+    except Exception as e:
+        logger.error(f"❌ Table creation failed for {contract_id}: {str(e)}")
+        raise
+
+
+def task_collect_results(validation_results: List[Dict],
+                         schema_results: List[Dict],
+                         table_results: List[Dict],
+                         **context):
+    """Collect and aggregate results from all dynamic task instances.
+
+    This task runs once after all per-contract tasks complete.
+    Handles partial failures gracefully.
+
+    Args:
+        validation_results: List of validation results from all contracts
+        schema_results: List of schema registration results from all contracts
+        table_results: List of table creation results from all contracts
+
+    Returns:
+        Dict with aggregated results
     """
     ti = context["task_instance"]
 
-    # Get validation results (to know which contracts to process)
-    validation_results = ti.xcom_pull(
-        task_ids="validate_contracts",
-        key="validation_results"
-    )
+    logger.info("📊 Collecting results from all contract processing tasks")
 
-    if not validation_results:
-        logger.info("No valid contracts to create tables for")
-        return []
+    # Ensure we have lists
+    validation_results = validation_results if isinstance(validation_results, list) else [validation_results] if validation_results else []
+    schema_results = schema_results if isinstance(schema_results, list) else [schema_results] if schema_results else []
+    table_results = table_results if isinstance(table_results, list) else [table_results] if table_results else []
 
-    valid_contracts = [r for r in validation_results if r["status"] == "valid"]
-
-    logger.info(f"🗄️  Creating {len(valid_contracts)} Iceberg tables")
-
-    table_results = []
-    failures = []
-    for result in valid_contracts:
-        contract_path = result["file_path"]
-        try:
-            # Run async function in event loop
-            table_result = asyncio.run(ContractTasks.create_iceberg_table(contract_path))
-            table_results.append(table_result)
-        except Exception as e:
-            logger.error(f"❌ Table creation failed for {contract_path}: {str(e)}")
-            table_results.append({
-                "file_path": contract_path,
-                "contract_id": result.get("contract_id", "unknown"),
-                "status": "failed",
-                "error": str(e),
-            })
-            failures.append((contract_path, str(e)))
-
-    # Push results to XCom
-    ti.xcom_push(key="table_results", value=table_results)
-
-    created = sum(1 for r in table_results if r.get("status") == "created")
-    updated = sum(1 for r in table_results if r.get("status") == "updated")
-    logger.info(
-        f"✅ Table creation complete: {created} created, {updated} updated "
-        f"({len(table_results)} total)"
-    )
-
-    # Fail the task if any table creations failed
-    if failures:
-        error_msg = "; ".join([f"{path}: {error}" for path, error in failures])
-        raise Exception(f"Table creation failed for {len(failures)} contract(s): {error_msg}")
-
-    return table_results
-
-
-
-
-def task_collect_and_format_results(**context):
-    """Collect results from all tasks and format for GitHub."""
-    ti = context["task_instance"]
-
-    # Get all results from previous tasks
-    validation_results = ti.xcom_pull(task_ids="validate_contracts", key="validation_results") or []
-    schema_results = ti.xcom_pull(task_ids="register_schemas", key="schema_results") or []
-    table_results = ti.xcom_pull(task_ids="create_iceberg_tables", key="table_results") or []
-
-    logger.info("📊 Collecting results from all tasks")
-
-    # Collect results
+    # Collect results via ContractTasks library
     aggregated = ContractTasks.collect_results(validation_results, schema_results, table_results)
 
-    # Push aggregated results to XCom
+    # Push to XCom for reporting task
     ti.xcom_push(key="aggregated_results", value=aggregated)
 
     # Format for GitHub
@@ -286,9 +227,11 @@ def task_collect_and_format_results(**context):
 
 
 def task_report_to_github(**context):
-    """Report results to GitHub PR (if applicable).
+    """Report aggregated results to GitHub PR.
 
-    This is a placeholder task. In production, use:
+    This task runs once after all contracts are processed and results aggregated.
+
+    Note: This is a placeholder. In production, implement using:
     - PyGithub library
     - GitHub Actions with gh CLI
     - Webhooks back to GitHub Actions
@@ -296,7 +239,7 @@ def task_report_to_github(**context):
     ti = context["task_instance"]
 
     github_payload = ti.xcom_pull(
-        task_ids="collect_and_format_results",
+        task_ids="aggregate_results",
         key="github_payload"
     )
 
@@ -326,46 +269,63 @@ def task_report_to_github(**context):
 
 
 # ============================================================================
-# DAG Tasks
+# DAG Structure with Dynamic Task Mapping
 # ============================================================================
 
 with dag:
+    # Step 1: Fetch all contract files
     fetch_task = PythonOperator(
         task_id="fetch_contracts",
         python_callable=task_fetch_contracts,
-        doc="Fetch contract files from contracts/current directory",
+        doc="Fetch contract file paths from contracts/current directory",
     )
 
-    validate_task = PythonOperator(
-        task_id="validate_contracts",
-        python_callable=task_validate_contracts,
-        doc="Validate each contract against schema",
+    # Step 2: Dynamic task expansion - one validate task per contract
+    # Each contract is processed independently; failure in one doesn't block others
+    validate_tasks = PythonOperator.partial(
+        task_id="validate_contract",
+        python_callable=task_validate_contract,
+    ).expand(
+        op_args=[[contract_path] for contract_path in fetch_task.output]
     )
 
-    register_task = PythonOperator(
-        task_id="register_schemas",
-        python_callable=task_register_schemas,
-        doc="Register contracts as schemas in AWS Glue Schema Registry",
-    )
+    # Step 3: Provision tasks within a task group for organization
+    # Both schema registration and table creation run in parallel per contract
+    with TaskGroup("provision", tooltip="Schema registration and table provisioning per contract") as provision_group:
 
-    create_tables_task = PythonOperator(
-        task_id="create_iceberg_tables",
-        python_callable=task_create_iceberg_tables,
-        doc="Create/update Iceberg tables in AWS Glue Catalog (only after schemas registered)",
-    )
+        register_tasks = PythonOperator.partial(
+            task_id="register_schema",
+            python_callable=task_register_schema,
+        ).expand(
+            op_args=[[result] for result in validate_tasks.output]
+        )
 
+        create_table_tasks = PythonOperator.partial(
+            task_id="create_table",
+            python_callable=task_create_table,
+        ).expand(
+            op_args=[[result] for result in validate_tasks.output]
+        )
+
+    # Step 4: Collect and aggregate results from all dynamic task instances
     collect_task = PythonOperator(
-        task_id="collect_and_format_results",
-        python_callable=task_collect_and_format_results,
-        doc="Collect results from all tasks and format for GitHub",
+        task_id="aggregate_results",
+        python_callable=task_collect_results,
+        op_args=[
+            validate_tasks.output,
+            provision_group.register_schema.output,
+            provision_group.create_table.output,
+        ],
+        doc="Aggregate results from all per-contract processing tasks",
     )
 
+    # Step 5: Report to GitHub
     github_task = PythonOperator(
         task_id="report_to_github",
         python_callable=task_report_to_github,
-        doc="Report results to GitHub PR as comment",
+        doc="Report aggregated results to GitHub PR as comment",
     )
 
-    # DAG dependency (fully sequential)
-    # fetch → validate → register → create_tables → collect → github
-    fetch_task >> validate_task >> register_task >> create_tables_task >> collect_task >> github_task
+    # DAG dependency chain
+    # fetch → [validate per contract] → provision group [register & create per contract] → aggregate → report
+    fetch_task >> validate_tasks >> provision_group >> collect_task >> github_task
