@@ -286,46 +286,46 @@ with dag:
         task_id="validate_contract",
         python_callable=task_validate_contract,
     ).expand(
-        op_args=[[contract_path] for contract_path in fetch_task.output]
+        op_args=fetch_task.output.map(lambda x: [x])
     )
 
-    # Step 3: Provision tasks within a task group for organization
-    # Both schema registration and table creation run in parallel per contract
-    with TaskGroup("provision", tooltip="Schema registration and table provisioning per contract") as provision_group:
-
+    # Step 3: Schema provisioning task group
+    # Register schemas in AWS Glue per contract
+    with TaskGroup("schema_provisioning", tooltip="Schema registration in AWS Glue per contract") as schema_group:
         register_tasks = PythonOperator.partial(
             task_id="register_schema",
             python_callable=task_register_schema,
         ).expand(
-            op_args=[[result] for result in validate_tasks.output]
+            op_args=validate_tasks.output.map(lambda x: [x])
         )
 
+    # Step 4: Table creation task group
+    # Create/update Iceberg tables per contract
+    with TaskGroup("table_creation", tooltip="Iceberg table creation/update per contract") as table_group:
         create_table_tasks = PythonOperator.partial(
             task_id="create_table",
             python_callable=task_create_table,
         ).expand(
-            op_args=[[result] for result in validate_tasks.output]
+            op_args=validate_tasks.output.map(lambda x: [x])
         )
 
-    # Step 4: Collect and aggregate results from all dynamic task instances
+    # Step 5: Collect and aggregate results from all dynamic task instances
     collect_task = PythonOperator(
         task_id="aggregate_results",
         python_callable=task_collect_results,
         op_args=[
             validate_tasks.output,
-            provision_group.register_schema.output,
-            provision_group.create_table.output,
+            register_tasks.output,
+            create_table_tasks.output,
         ],
         doc="Aggregate results from all per-contract processing tasks",
     )
 
-    # Step 5: Report to GitHub
+    # Step 6: Report to GitHub
     github_task = PythonOperator(
         task_id="report_to_github",
         python_callable=task_report_to_github,
         doc="Report aggregated results to GitHub PR as comment",
     )
 
-    # DAG dependency chain
-    # fetch → [validate per contract] → provision group [register & create per contract] → aggregate → report
-    fetch_task >> validate_tasks >> provision_group >> collect_task >> github_task
+    fetch_task >> validate_tasks >> schema_group >> table_group >> collect_task >> github_task
