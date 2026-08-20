@@ -23,20 +23,22 @@ logger = logging.getLogger(__name__)
 class AwsGlueAdapter:
     """Unified adapter for AWS Glue Schema Registry and Iceberg operations."""
 
-    def __init__(self, region: str = None, registry_name: str = None, enforce_sql_safety: bool = True):
+    def __init__(self, region: str = None, registry_name: str = None, enforce_sql_safety: bool = True, engine: str = "iceberg"):
         """Initialize the adapter.
 
         Args:
             region: AWS region (defaults to AWS_DEFAULT_REGION env var or us-east-1)
             registry_name: Name of Glue Schema Registry (defaults to schema-registry)
             enforce_sql_safety: If True, enforce SQL-safety checks on schema changes
+            engine: Target SQL engine (iceberg, athena, redshift, spark)
         """
         self.region = region or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
         self.registry_name = registry_name or os.getenv("TF_VAR_registry_name", "schema-registry")
         self.glue = boto3.client("glue", region_name=self.region)
         self.sts = boto3.client("sts", region_name=self.region)
         self.enforce_sql_safety = enforce_sql_safety
-        self.sql_validator = SchemaSafetyValidator(strict_mode=enforce_sql_safety)
+        self.engine = engine
+        self.sql_validator = SchemaSafetyValidator(strict_mode=enforce_sql_safety, engine=engine)
         self.impact_analyzer = DownstreamImpactAnalyzer(self.glue)
 
     # ============================================================================

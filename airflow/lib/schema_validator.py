@@ -36,14 +36,16 @@ class SqlReservedWords:
 class SchemaSafetyValidator:
     """Validates schema changes for SQL-safety across SQL dialects."""
 
-    def __init__(self, strict_mode: bool = True):
+    def __init__(self, strict_mode: bool = True, engine: str = "iceberg"):
         """
         Initialize validator.
 
         Args:
             strict_mode: If True, reject risky changes; if False, warn only
+            engine: Target SQL engine (iceberg, athena, redshift, spark)
         """
         self.strict_mode = strict_mode
+        self.engine = engine.lower()
 
     def validate_schema_change(
         self,
@@ -93,6 +95,9 @@ class SchemaSafetyValidator:
         # Check 6: Field name changes (renaming)
         violations.extend(self._check_field_renames(old_fields, new_fields))
 
+        # Check 7: Nullable → Non-nullable promotions (data loss)
+        violations.extend(self._check_nullable_promotion(old_fields, new_fields))
+
         # Determine if safe
         has_errors = any(v["type"] == "error" for v in violations)
         is_safe = not has_errors
@@ -136,11 +141,12 @@ class SchemaSafetyValidator:
             if old_type == new_type:
                 continue
 
-            is_safe, reason = self._is_type_change_safe(old_type, new_type)
+            is_safe, reason, requires_migration = self._is_type_change_safe(old_type, new_type)
 
             if not is_safe:
+                violation_type = "warning" if requires_migration else "error"
                 violations.append({
-                    "type": "error",
+                    "type": violation_type,
                     "field": field_name,
                     "message": f"Type change {self._format_type(old_type)} → "
                     f"{self._format_type(new_type)}: {reason}",
@@ -148,28 +154,54 @@ class SchemaSafetyValidator:
 
         return violations
 
-    def _is_type_change_safe(self, old_type: Any, new_type: Any) -> Tuple[bool, str]:
-        """Determine if a type change is safe for SQL workloads."""
+    def _is_type_change_safe(self, old_type: Any, new_type: Any) -> Tuple[bool, str, bool]:
+        """
+        Determine if a type change is safe for SQL workloads.
 
+        Returns:
+            (is_automatically_safe, message, requires_migration)
+            - is_automatically_safe: Can apply immediately without backfill
+            - message: Human-readable explanation
+            - requires_migration: Needs data migration plan
+        """
         # Normalize union types (e.g., ["null", "string"])
         old_base = self._normalize_type(old_type)
         new_base = self._normalize_type(new_type)
 
         if old_base == new_base:
-            return True, "No type change"
+            return True, "No type change", False
 
-        # Safe widening changes
-        safe_widening = {
-            ("int", "long"): "numeric widening is safe",
-            ("float", "double"): "numeric widening is safe",
-            ("int", "double"): "numeric widening is safe",
-            ("int", "string"): "can cast to string safely",
+        # Safe widening changes (engine-aware)
+        # Iceberg supports metadata-only type promotion without table recreation
+        # Other engines may require table recreation
+        iceberg_safe_widening = {
+            ("int", "long"): "Iceberg supports metadata-only type promotion (no recreation needed)",
+            ("float", "double"): "Iceberg supports metadata-only type promotion (no recreation needed)",
+            ("int", "double"): "Iceberg supports metadata-only type promotion (no recreation needed)",
         }
 
-        if (old_base, new_base) in safe_widening:
-            if self.strict_mode:
-                return False, "type changes require table recreation"
-            return True, safe_widening[(old_base, new_base)]
+        other_engine_safe_widening = {
+            ("int", "long"): "Safe widening but may require table recreation depending on SQL engine",
+            ("float", "double"): "Safe widening but may require table recreation depending on SQL engine",
+            ("int", "double"): "Safe widening but may require table recreation depending on SQL engine",
+        }
+
+        string_conversions = {
+            ("int", "string"): "Safe direction but requires backfill of existing data",
+        }
+
+        # Check Iceberg promotions
+        if self.engine == "iceberg" and (old_base, new_base) in iceberg_safe_widening:
+            return True, iceberg_safe_widening[(old_base, new_base)], False
+
+        # Check other engine safe widening
+        if (old_base, new_base) in other_engine_safe_widening:
+            msg = other_engine_safe_widening[(old_base, new_base)]
+            return False, msg, True
+
+        # String conversions (safe direction but require backfill)
+        if (old_base, new_base) in string_conversions:
+            return False, string_conversions[(old_base, new_base)], True
 
         # Unsafe narrowing changes
         unsafe_changes = {
@@ -181,10 +213,10 @@ class SchemaSafetyValidator:
         }
 
         if (old_base, new_base) in unsafe_changes:
-            return False, unsafe_changes[(old_base, new_base)]
+            return False, unsafe_changes[(old_base, new_base)], False
 
         # Other changes require migration planning
-        return False, f"type change requires data migration (schema versioning needed)"
+        return False, "type change requires data migration (schema versioning needed)", True
 
     def _check_new_required_fields(self, old_fields: Dict, new_fields: Dict) -> List[Dict]:
         """Check for new required fields without defaults."""
@@ -244,52 +276,100 @@ class SchemaSafetyValidator:
         return violations
 
     def _check_reserved_words(self, new_fields: Dict) -> List[Dict]:
-        """Check for SQL reserved word conflicts."""
+        """Check for SQL reserved word conflicts (case-insensitive)."""
         violations = []
 
         for field_name in new_fields.keys():
-            if field_name.lower() in SqlReservedWords.RESERVED:
+            field_lower = field_name.lower()
+
+            if field_lower in SqlReservedWords.RESERVED:
                 violations.append({
                     "type": "warning",
                     "field": field_name,
                     "message": (
-                        f"Column '{field_name}' is a SQL reserved word. "
-                        f"Must use backticks or double quotes in queries. "
-                        f"Recommended: rename to avoid confusion."
+                        f"Column '{field_name}' is a SQL reserved word ('{field_lower}'). "
+                        f"Must use backticks or double quotes in queries: "
+                        f'SELECT `{field_name}` FROM table; '
+                        f"Recommended: rename to avoid confusion and query complications."
+                    ),
+                })
+
+        return violations
+
+    def _check_nullable_promotion(self, old_fields: Dict, new_fields: Dict) -> List[Dict]:
+        """Detect fields made non-nullable (critical data loss risk)."""
+        violations = []
+
+        for field_name in old_fields.keys() & new_fields.keys():
+            old_type = old_fields[field_name].get("type")
+            new_type = new_fields[field_name].get("type")
+
+            old_nullable = self._is_nullable_type(old_type)
+            new_nullable = self._is_nullable_type(new_type)
+
+            # Check for nullable → non-nullable promotion (data loss)
+            if old_nullable and not new_nullable:
+                violations.append({
+                    "type": "error",
+                    "field": field_name,
+                    "message": (
+                        f"Field '{field_name}' promoted from nullable to non-nullable. "
+                        f"Existing NULL values will be unreadable. "
+                        f"SQL queries will fail with 'Cannot read null as non-null'. "
+                        f"Solution: Keep field nullable or backfill NULL values before change."
                     ),
                 })
 
         return violations
 
     def _check_field_renames(self, old_fields: Dict, new_fields: Dict) -> List[Dict]:
-        """Detect potential field renames (same position, different name)."""
+        """Detect field renames using semantic analysis, not position matching."""
         violations = []
 
-        old_order = list(old_fields.keys())
-        new_order = list(new_fields.keys())
-
-        # Find fields that exist in old but not in new
         removed = set(old_fields.keys()) - set(new_fields.keys())
         added = set(new_fields.keys()) - set(old_fields.keys())
 
-        # Heuristic: if one field removed and one added at same position, might be rename
-        if len(removed) == 1 and len(added) == 1:
+        # Strategy 1: Check documentation for explicit rename markers
+        rename_candidates = []
+        for old_name in removed:
+            old_field = old_fields[old_name]
+            old_doc = old_field.get("doc", "")
+
+            for new_name in added:
+                new_field = new_fields[new_name]
+                new_doc = new_field.get("doc", "")
+
+                # Look for "renamed from X" or "previously X" markers
+                if (f"renamed from {old_name}" in new_doc.lower() or
+                    f"previously {old_name}" in new_doc.lower()):
+                    rename_candidates.append((old_name, new_name))
+                    break
+
+        # Strategy 2: Type compatibility hint (only if types EXACTLY match)
+        # Position is meaningless in Avro; only use type as semantic indicator
+        if not rename_candidates and len(removed) == 1 and len(added) == 1:
             removed_name = list(removed)[0]
             added_name = list(added)[0]
-            removed_idx = old_order.index(removed_name)
-            added_idx = new_order.index(added_name)
 
-            if removed_idx == added_idx:
-                violations.append({
-                    "type": "error",
-                    "field": removed_name,
-                    "message": (
-                        f"Possible field rename: '{removed_name}' → '{added_name}' "
-                        f"at position {removed_idx}. All downstream SQL queries "
-                        f"referencing '{removed_name}' will fail. "
-                        f"Plan consumer migration or use alias columns."
-                    ),
-                })
+            old_type = old_fields[removed_name].get("type")
+            new_type = new_fields[added_name].get("type")
+
+            # Only flag if types are EXACTLY the same (strong semantic indicator)
+            if old_type == new_type:
+                rename_candidates.append((removed_name, added_name))
+
+        # Report all rename candidates as errors
+        for old_name, new_name in rename_candidates:
+            violations.append({
+                "type": "error",
+                "field": old_name,
+                "message": (
+                    f"Possible field rename: '{old_name}' → '{new_name}'. "
+                    f"All downstream SQL queries referencing '{old_name}' will fail. "
+                    f"To confirm rename, add 'renamed from {old_name}' to '{new_name}' doc string. "
+                    f"Or use alias column pattern for backward compatibility."
+                ),
+            })
 
         return violations
 
