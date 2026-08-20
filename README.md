@@ -1,6 +1,23 @@
 # Data Contract Flow
 
-A contract-driven data pipeline orchestration system using Apache Airflow, AWS Glue Schema Registry, and Iceberg tables. Automatically validates, registers, and provisions data contracts through a scalable DAG-based workflow.
+A contract-driven data pipeline orchestration system using Apache Airflow, AWS Glue Schema Registry, and Iceberg tables. Automatically validates, registers, and provisions data contracts through a scalable DAG-based workflow with **SQL-safe schema evolution**.
+
+> **New in v2.0:** Comprehensive SQL-safety validation prevents schema changes that break downstream SQL queries. See [SQL Safety Features](#-sql-safety-features) below.
+
+## 🆕 Latest Release: Critical Bug Fixes (v2.0.1)
+
+Three critical bugs in the SQL-safety validator have been fixed:
+
+| Bug | Issue | Fix | Impact |
+|-----|-------|-----|--------|
+| **#1** | Type widening blocked (int→long) | Engine-aware validation (Iceberg allows) | ✅ Unblocks schema evolution |
+| **#2** | Rename detection used position heuristic | Semantic analysis with doc markers | ✅ No false positives/negatives |
+| **#3** | Reserved words case-insensitive | Case-insensitive checking for all variants | ✅ Catches SELECT, Select, select |
+| **#4** | Nullable→non-nullable not detected | New validation check added | ✅ Prevents data loss |
+
+**See:** [BUG_FIXES_QUICK_REFERENCE.md](BUG_FIXES_QUICK_REFERENCE.md) for details on each fix.
+
+---
 
 ## Quick Start
 
@@ -24,15 +41,70 @@ open http://localhost:8080
 make airflow-trigger
 ```
 
+## 🆕 SQL-Safety Features
+
+**Problem:** Schema registries validate AVRO compatibility, not SQL queries. Changes that pass validation can still break production queries.
+
+**Solution:** SQL-safety validation layer that catches ~80% of breaking changes at registration time.
+
+### What Gets Validated
+
+#### Level 1: Blocked Changes (Errors)
+```python
+❌ Field removal                          → Use deprecation (30-day grace period)
+❌ Field renaming                         → Document with "renamed from X" marker
+❌ Adding required field without default  → Add a default value
+❌ Type narrowing (long→int)             → Data loss risk
+❌ Nullable→non-nullable promotion       → Existing NULLs become unreadable
+❌ SQL reserved word conflicts           → Use backticks or alias
+```
+
+#### Level 2: Warning Changes (Safe but need planning)
+```python
+⚠️  Type changes requiring migration     → Safe direction but needs backfill
+⚠️  Column reordering                    → Use explicit column names
+⚠️  New required field with default      → Needs backfill of old rows
+```
+
+#### Level 3: Safe Changes (Auto-Allowed)
+```python
+✅ Add optional field                    → Register immediately
+✅ Mark field as DEPRECATED              → Gives consumers time to migrate
+✅ Add computed field                    → No data impact
+✅ Type widening (Iceberg)              → Metadata-only change
+```
+
+### Example: Safe vs Unsafe Evolution
+
+```python
+# ✅ SAFE: Add optional field
+v1 = {"fields": [{"name": "user_id", "type": "string"}]}
+v2 = {"fields": [
+    {"name": "user_id", "type": "string"},
+    {"name": "email", "type": ["null", "string"], "default": None}
+]}
+
+# ❌ UNSAFE: Remove field
+v1 = {"fields": [{"name": "user_id", "type": "string"}, {"name": "deprecated", "type": "string"}]}
+v2 = {"fields": [{"name": "user_id", "type": "string"}]}
+# Solution: Mark as DEPRECATED first (v1.1), remove in v2.0 after 30+ days
+
+# ⚠️ NEEDS MIGRATION: Type widening (Iceberg)
+v1 = {"fields": [{"name": "count", "type": "int"}]}
+v2 = {"fields": [{"name": "count", "type": "long"}]}
+# Iceberg allows this as metadata-only change (no table recreation needed)
+```
+
 ## What It Does
 
 The `contract_provisioning` DAG orchestrates a complete contract lifecycle:
 
 1. **Fetch Contracts** — Discover contract files in `contracts/current/`
 2. **Validate** — Verify JSON schema, required fields, and data types
-3. **Register Schemas** — Create AVRO schemas in AWS Glue Schema Registry
-4. **Create Tables** — Provision Iceberg tables in AWS Glue Catalog
-5. **Report Results** — Comment on GitHub PRs with provisioning status
+3. **Validate SQL-Safety** — Check for breaking changes to downstream queries
+4. **Register Schemas** — Create AVRO schemas in AWS Glue Schema Registry with SQL-safety checks
+5. **Create Tables** — Provision Iceberg tables in AWS Glue Catalog
+6. **Report Results** — Comment on GitHub PRs with provisioning status
 
 ## Architecture
 
@@ -41,7 +113,9 @@ Airflow 3.3.0
 ├── contract_provisioning (DAG)
 │   ├── fetch_contracts
 │   ├── validate_contracts
+│   ├── validate_sql_safety          ← NEW: Prevents breaking changes
 │   ├── register_schemas (parallel)
+│   │   └── [with SQL-safety checks]
 │   ├── create_iceberg_tables (parallel)
 │   ├── collect_and_format_results
 │   └── report_to_github
@@ -51,11 +125,57 @@ Airflow 3.3.0
 
 AWS Services
 ├── Glue Schema Registry
+│   └── SchemaSafetyValidator        ← NEW: SQL-safety validation
 └── Glue Catalog (Iceberg tables)
 
 GitHub Actions
 └── Triggers DAG when contracts/current/** changes
 ```
+
+### SQL-Safety Validation Flow
+
+```
+Schema Change Registration
+    │
+    ├─→ [1] Fetch old schema version
+    │
+    ├─→ [2] Validate SQL-Safety
+    │   ├─ Check field removals
+    │   ├─ Check type changes (engine-aware)
+    │   ├─ Check new required fields
+    │   ├─ Check column reordering
+    │   ├─ Check reserved words
+    │   ├─ Check field renames
+    │   └─ Check nullable promotions
+    │
+    ├─→ [3] Analyze Downstream Impact
+    │   ├─ Find affected tables
+    │   └─ Assess migration complexity
+    │
+    ├─→ [4] AVRO Compatibility Check
+    │   └─ Glue's native validation
+    │
+    ├─→ [5] Register Schema
+    │   └─ Create new version in registry
+    │
+    └─→ [6] Report Results
+        ├─ Violations found? → Block with clear errors
+        └─ Safe? → Register and notify consumers
+```
+
+## 📖 SQL-Safety Documentation
+
+**Want to understand how it all works?** Read the comprehensive guides:
+
+| Document | Purpose | Audience |
+|----------|---------|----------|
+| **[SQL_SAFETY_LOGIC_EXPLAINED.md](SQL_SAFETY_LOGIC_EXPLAINED.md)** | Deep dive into all 7 validation checks with examples | Engineers, Architects |
+| **[BUG_FIXES_QUICK_REFERENCE.md](BUG_FIXES_QUICK_REFERENCE.md)** | Quick reference for the bug fixes applied | All users |
+| **[FIXES_APPLIED.md](FIXES_APPLIED.md)** | Detailed technical explanation of what was fixed | Developers |
+| **[README_SQL_SAFETY.md](README_SQL_SAFETY.md)** | Quick start guide for SQL-safety features | All users |
+| **[SCHEMA_EVOLUTION_CHECKLIST.md](SCHEMA_EVOLUTION_CHECKLIST.md)** | Operational checklist for schema changes | Data Producers |
+
+**Start here:** [SQL_SAFETY_LOGIC_EXPLAINED.md](SQL_SAFETY_LOGIC_EXPLAINED.md) for the complete logic explanation.
 
 ## Project Structure
 
