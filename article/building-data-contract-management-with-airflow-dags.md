@@ -17,40 +17,42 @@ But implementing contracts in a real system is harder than the concept suggests:
 
 Microservices-based approaches exist, but they introduce deployment overhead, service-to-service communication, and operational complexity. A better path: leverage Airflow's native ability to orchestrate validation, registration, and provisioning in a single DAG.
 
-## Architecture: A DAG-Driven Approach
+## Architecture: A DAG-Driven Approach with Per-Contract Isolation
 
-The core design is straightforward: one Airflow DAG orchestrates the complete contract lifecycle.
+The core design uses Airflow's dynamic task mapping to orchestrate the complete contract lifecycle with true per-contract isolation:
 
 ```
 contract_provisioning (DAG)
 ├── fetch_contracts (discover contract files)
-├── validate_contracts (check schema, fields, types)
-├── register_schemas (parallel tasks → AWS Glue Schema Registry)
-├── create_iceberg_tables (parallel tasks → AWS Glue Catalog)
-├── collect_and_format_results (aggregate outcomes)
+├── validate_contract[1..N] (per-contract, parallel)
+├── schema_provisioning.register_schema[1..N] (per-contract, sequential after validation)
+├── table_creation.create_table[1..N] (per-contract, after schema registration)
+├── aggregate_results (collect outcomes from all contracts)
 └── report_to_github (comment on PR with status)
 ```
 
-Each task is a discrete, testable unit:
+Each stage processes contracts independently:
 
-1. **Fetch Contracts**: Scan `contracts/current/` directory for JSON contract definitions.
-2. **Validate Contracts**: Verify JSON structure, required fields (contract_id, name, columns), and data types.
-3. **Register Schemas**: Convert contracts to AVRO format and register in AWS Glue Schema Registry.
-4. **Create Iceberg Tables**: Provision Iceberg tables in AWS Glue Catalog with schema from registry.
-5. **Collect Results**: Aggregate validation and provisioning results into a structured report.
+1. **Fetch Contracts**: Scan `contracts/current/` directory for JSON contract definitions. Returns list for dynamic expansion.
+2. **Validate Contracts** [dynamic]: One task per contract. Verify JSON structure, required fields (contract_id, name, columns), and data types.
+3. **Register Schemas** [dynamic, sequential]: One per-contract schema registration in AWS Glue Schema Registry. Only runs after validation succeeds for that contract.
+4. **Create Iceberg Tables** [dynamic, sequential]: One per-contract table creation in AWS Glue Catalog. Only runs after schema registration succeeds for that contract.
+5. **Aggregate Results**: Collect validation and provisioning results from all contract task instances into a structured report.
 6. **Report to GitHub**: Comment on pull requests with provisioning status and any errors.
 
 **Why this architecture?**
 
+- **True per-contract isolation**: Each contract gets its own task instances throughout the pipeline. Failure in one contract doesn't block others.
 - **Centralized orchestration**: Airflow is the single source of truth for contract processing.
-- **Parallel execution**: Register schemas and create tables concurrently for hundreds of contracts without overhead.
+- **Sequential per-contract provisioning**: Schema registration must succeed before table creation for each contract—guarantees consistency.
+- **Parallel across contracts**: With 100 contracts, you get 100 validate tasks, 100 register tasks, and 100 create tasks running concurrently (within Airflow executor limits).
 - **Error handling built-in**: Failed tasks trigger retries, alerts, and rollback paths automatically.
-- **Auditability**: Every task execution is logged; Airflow UI shows the full DAG history.
+- **Native visibility**: Airflow UI shows each contract's individual status through the entire pipeline.
 - **No service boundaries**: No inter-service communication, no distributed tracing headaches, no deployment choreography.
 
-## Implementation: The Contract Provisioning DAG
+## Implementation: The Contract Provisioning DAG with Per-Contract Isolation
 
-Let's walk through a simplified DAG that captures the pattern:
+The production DAG uses Airflow's dynamic task mapping for true per-contract isolation. Here's a simplified version capturing the pattern:
 
 ```python
 from airflow import DAG
@@ -58,16 +60,16 @@ from airflow.operators.python import PythonOperator
 from airflow.models import Variable
 from airflow.utils.task_group import TaskGroup
 from datetime import datetime, timedelta
-import json
 import logging
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 default_args = {
-    'owner': 'data-platform',
+    'owner': 'data-engineering',
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
+    'execution_timeout': timedelta(minutes=30),
 }
 
 dag = DAG(
@@ -75,265 +77,235 @@ dag = DAG(
     default_args=default_args,
     schedule_interval=None,
     catchup=False,
-    start_date=datetime(2024, 1, 1),
+    start_date=datetime(2026, 1, 1),
 )
 
-CONTRACTS_DIR = Variable.get("contracts_dir", "contracts/current")
-GLUE_REGISTRY_NAME = Variable.get("glue_registry_name", "default-registry")
-GLUE_DATABASE = Variable.get("glue_database", "contracts")
-S3_BUCKET = Variable.get("s3_iceberg_bucket", "your-bucket")
-ICEBERG_PATH_PREFIX = Variable.get("iceberg_path_prefix", "iceberg")
+def task_fetch_contracts(**context):
+    """Fetch contract file paths for dynamic expansion"""
+    repo_path = Variable.get("repo_path", "/app")
+    contracts_dir = Variable.get("contracts_dir", "contracts/current")
+    
+    contract_files = []
+    for contract_file in (Path(repo_path) / contracts_dir).rglob("*.json"):
+        contract_files.append(str(contract_file))
+        logger.info(f"📋 Found contract: {contract_file}")
+    
+    if not contract_files:
+        logger.warning("⚠️  No contract files found")
+        return []
+    
+    logger.info(f"Found {len(contract_files)} contract files")
+    return contract_files
 
-def fetch_contracts(**context):
-    """Discover and load contract files"""
-    contracts = []
-    
-    for contract_file in Path(CONTRACTS_DIR).rglob("*.json"):
-        try:
-            with open(contract_file) as f:
-                contract = json.load(f)
-                contracts.append({
-                    'path': str(contract_file),
-                    'contract_id': contract['contract_id'],
-                    'name': contract['name'],
-                    'columns': contract['columns'],
-                })
-                logger.info(f"Loaded contract: {contract['contract_id']}")
-        except Exception as e:
-            logger.error(f"Failed to load {contract_file}: {str(e)}")
-    
-    if not contracts:
-        logger.warning("No contracts found in {CONTRACTS_DIR}")
-    
-    return contracts
 
-def validate_contract(contract, **context):
-    """Validate single contract"""
-    required_fields = ['contract_id', 'name', 'columns']
-    contract_id = contract.get('contract_id', 'unknown')
+def task_validate_contract(contract_path: str, **context):
+    """Validate a single contract file.
+    
+    This task runs once per contract (via dynamic expansion).
+    Failure in one contract doesn't block others.
+    """
+    from tasks.contract_tasks import ContractTasks
     
     try:
-        for field in required_fields:
-            if field not in contract:
-                raise ValueError(f"Missing required field: {field}")
-        
-        for col in contract['columns']:
-            if 'name' not in col or 'data_type' not in col:
-                raise ValueError(f"Column missing 'name' or 'data_type': {col}")
-        
-        logger.info(f"✓ Validated {contract_id}")
-        return {
-            'contract_id': contract_id,
-            'status': 'valid',
-            'columns': contract['columns'],
-        }
+        result = ContractTasks.validate_contract(contract_path)
+        result["file_path"] = contract_path
+        result["status"] = "valid"
+        logger.info(f"✅ Validated {result.get('contract_id')}")
+        return result
     except ValueError as e:
-        logger.error(f"✗ Validation failed for {contract_id}: {str(e)}")
+        logger.error(f"❌ Validation failed for {contract_path}: {str(e)}")
         raise
 
-def register_schema(contract, **context):
-    """Register single contract as AVRO schema"""
-    from airflow.providers.amazon.aws.hooks.glue_catalog import GlueCatalogHook
+
+def task_register_schema(validation_result: dict, **context):
+    """Register validated contract as AVRO schema in AWS Glue.
     
-    contract_id = contract['contract_id']
+    This runs once per contract after validation succeeds.
+    Failure in one contract doesn't affect others.
+    """
+    from tasks.contract_tasks import ContractTasks
+    
+    contract_path = validation_result["file_path"]
+    contract_id = validation_result.get("contract_id", "unknown")
     
     try:
-        avro_schema = convert_contract_to_avro(contract)
-        
-        hook = GlueCatalogHook()
-        registry = hook.get_client()
-        
-        response = registry.create_schema(
-            RegistryId={'RegistryName': GLUE_REGISTRY_NAME},
-            SchemaName=contract_id,
-            DataFormat='AVRO',
-            Compatibility='BACKWARD',
-            SchemaDefinition=json.dumps(avro_schema),
-        )
-        
-        logger.info(f"✓ Registered schema for {contract_id}")
-        return {
-            'contract_id': contract_id,
-            'status': 'registered',
-            'schema_arn': response['SchemaArn'],
-        }
+        schema_result = ContractTasks.register_schema(contract_path)
+        logger.info(f"✅ Registered schema for {contract_id}")
+        return schema_result
     except Exception as e:
-        logger.error(f"✗ Failed to register {contract_id}: {str(e)}")
+        logger.error(f"❌ Schema registration failed for {contract_id}: {str(e)}")
         raise
 
-def create_table(contract, **context):
-    """Create single Iceberg table"""
-    from airflow.providers.amazon.aws.hooks.glue import GlueHook
+
+def task_create_table(validation_result: dict, **context):
+    """Create Iceberg table from validated contract schema.
     
-    contract_id = contract['contract_id']
+    This runs only after schema registration succeeds for that contract.
+    Sequential per-contract: schema → table (guarantees schema exists).
+    """
+    from tasks.contract_tasks import ContractTasks
+    
+    contract_path = validation_result["file_path"]
+    contract_id = validation_result.get("contract_id", "unknown")
     
     try:
-        iceberg_location = f"s3://{S3_BUCKET}/{ICEBERG_PATH_PREFIX}/{contract_id}/"
-        
-        hook = GlueHook()
-        glue = hook.get_client()
-        
-        glue.create_table(
-            DatabaseName=GLUE_DATABASE,
-            TableInput={
-                'Name': contract_id,
-                'StorageDescriptor': {
-                    'Columns': [
-                        {'Name': col['name'], 'Type': col['data_type']}
-                        for col in contract['columns']
-                    ],
-                    'Location': iceberg_location,
-                    'InputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
-                    'OutputFormat': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
-                    'SerdeInfo': {
-                        'SerializationLibrary': 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe',
-                    },
-                },
-                'TableType': 'ICEBERG',
-            },
-        )
-        
-        logger.info(f"✓ Created table for {contract_id}")
-        return {
-            'contract_id': contract_id,
-            'status': 'created',
-            'location': iceberg_location,
-        }
+        table_result = ContractTasks.create_iceberg_table(contract_path)
+        logger.info(f"✅ Created table for {contract_id}")
+        return table_result
     except Exception as e:
-        logger.error(f"✗ Failed to create table for {contract_id}: {str(e)}")
+        logger.error(f"❌ Table creation failed for {contract_id}: {str(e)}")
         raise
 
-def collect_results(task_instance, **context):
-    """Aggregate all task results into provisioning report"""
-    # Pull all results from dynamic task instances
-    # With dynamic expansion, xcom_pull returns a list of results from all mapped tasks
-    validation_results = task_instance.xcom_pull(
-        task_ids='validate_contract',
-        key='return_value'
-    )
-    schema_results = task_instance.xcom_pull(
-        task_ids='provision.register_schema',
-        key='return_value'
-    )
-    table_results = task_instance.xcom_pull(
-        task_ids='provision.create_table',
-        key='return_value'
-    )
-    
-    # Ensure results are lists (may be single item or list from expand)
-    validation_results = validation_results if isinstance(validation_results, list) else [validation_results] if validation_results else []
-    schema_results = schema_results if isinstance(schema_results, list) else [schema_results] if schema_results else []
-    table_results = table_results if isinstance(table_results, list) else [table_results] if table_results else []
-    
-    report = {
-        'timestamp': datetime.now().isoformat(),
-        'schemas_registered': len([r for r in schema_results if r.get('status') == 'registered']),
-        'tables_created': len([r for r in table_results if r.get('status') == 'created']),
-        'results': [],
-    }
-    
-    for val_result in validation_results:
-        contract_id = val_result['contract_id']
-        report['results'].append({
-            'contract_id': contract_id,
-            'validation': val_result,
-            'schema': next((r for r in schema_results if r['contract_id'] == contract_id), None),
-            'table': next((r for r in table_results if r['contract_id'] == contract_id), None),
-        })
-    
-    logger.info(f"Report: {report['schemas_registered']} schemas, {report['tables_created']} tables")
-    task_instance.xcom_push(key='provisioning_report', value=report)
-    return report
 
-def report_to_github(task_instance, **context):
-    """Post aggregated results to GitHub PR"""
-    report = task_instance.xcom_pull(key='provisioning_report', task_ids='aggregate_results')
+def task_collect_results(validation_results: list, schema_results: list, 
+                         table_results: list, **context):
+    """Aggregate results from all dynamic task instances.
     
-    github_token = Variable.get("github_token", None)
-    github_repo = Variable.get("github_repo", None)
-    github_pr_number = Variable.get("github_pr_number", None)
+    Handles partial failures gracefully. If one contract failed,
+    others still have their results captured.
+    """
+    from tasks.contract_tasks import ContractTasks
+    from tasks.github_tasks import GitHubTasks
     
-    if not all([github_token, github_repo, github_pr_number]):
-        logger.warning("GitHub credentials not configured, skipping PR comment")
-        return {"status": "skipped"}
+    ti = context["task_instance"]
     
-    markdown = f"""✅ Contract Provisioning Results
+    logger.info("📊 Collecting results from all contracts")
+    
+    # Collect via library
+    aggregated = ContractTasks.collect_results(validation_results, schema_results, table_results)
+    
+    # Format for GitHub
+    github_payload = GitHubTasks.get_pr_comment_body(
+        aggregated,
+        github_pr_number=Variable.get("github_pr_number", None)
+    )
+    
+    ti.xcom_push(key="aggregated_results", value=aggregated)
+    ti.xcom_push(key="github_payload", value=github_payload)
+    
+    logger.info(f"✅ Results collected: {aggregated.get('schemas_registered')} schemas, "
+                f"{aggregated.get('tables_created')} tables")
+    return {"aggregated": aggregated}
 
-**Summary**: {report['schemas_registered']} schemas registered, {report['tables_created']} tables created
-
-| Contract | Validation | Schema | Table |
-|----------|-----------|--------|-------|
-"""
-    
-    for result in report['results']:
-        val_icon = "✓" if result['validation'] and result['validation']['status'] == 'valid' else "✗"
-        sch_icon = "✓" if result['schema'] and result['schema']['status'] == 'registered' else "✗"
-        tbl_icon = "✓" if result['table'] and result['table']['status'] == 'created' else "✗"
-        markdown += f"| {result['contract_id']} | {val_icon} | {sch_icon} | {tbl_icon} |\n"
-    
-    logger.info(f"Generated report for PR #{github_pr_number}")
-    return {"status": "posted", "pr": github_pr_number}
 
 # ============================================================================
 # DAG Structure with Dynamic Task Mapping
 # ============================================================================
 
-fetch = PythonOperator(
+# Step 1: Fetch contract files
+fetch_task = PythonOperator(
     task_id='fetch_contracts',
-    python_callable=fetch_contracts,
+    python_callable=task_fetch_contracts,
 )
 
-# Dynamic validation task: one instance per contract
-validate_contracts = PythonOperator.partial(
+# Step 2: Dynamic validation - one task per contract
+validate_tasks = PythonOperator.partial(
     task_id='validate_contract',
-    python_callable=validate_contract,
-).expand(op_args=[[contract] for contract in fetch.output])
+    python_callable=task_validate_contract,
+).expand(
+    op_args=fetch_task.output.map(lambda x: [x])
+)
 
-# Provision tasks: schema registration and table creation
-# Both run in parallel for all validated contracts
-with TaskGroup('provision') as provision_group:
-    register_schema = PythonOperator.partial(
+# Step 3: Schema registration in TaskGroup
+# One task per contract, runs after validation
+with TaskGroup('schema_provisioning') as schema_group:
+    register_tasks = PythonOperator.partial(
         task_id='register_schema',
-        python_callable=register_schema,
-    ).expand(op_args=[[contract] for contract in validate_contracts.output])
-    
-    create_table = PythonOperator.partial(
+        python_callable=task_register_schema,
+    ).expand(
+        op_args=validate_tasks.output.map(lambda x: [x])
+    )
+
+# Step 4: Table creation in TaskGroup  
+# One task per contract, runs after schema registration succeeds
+with TaskGroup('table_creation') as table_group:
+    create_table_tasks = PythonOperator.partial(
         task_id='create_table',
-        python_callable=create_table,
-    ).expand(op_args=[[contract] for contract in validate_contracts.output])
-    
-    # Both provisioning tasks run independently (no inter-dependencies)
-    # They both depend on validation via the expand reference
+        python_callable=task_create_table,
+    ).expand(
+        op_args=validate_tasks.output.map(lambda x: [x])
+    )
 
-# Aggregate results from all dynamic task instances
-aggregate_results = PythonOperator(
+# Step 5: Aggregate results
+collect_task = PythonOperator(
     task_id='aggregate_results',
-    python_callable=collect_results,
+    python_callable=task_collect_results,
+    op_args=[
+        validate_tasks.output,
+        register_tasks.output,
+        create_table_tasks.output,
+    ],
 )
 
-# Report to GitHub
-report_pr = PythonOperator(
+# Step 6: Report to GitHub
+github_task = PythonOperator(
     task_id='report_to_github',
-    python_callable=report_to_github,
+    python_callable=lambda: None,  # Implementation details omitted
 )
 
-# Task dependencies
-fetch >> validate_contracts >> provision_group >> aggregate_results >> report_pr
+# DAG Dependencies
+fetch_task >> validate_tasks >> schema_group >> table_group >> collect_task >> github_task
 ```
 
-The DAG architecture uses **dynamic task mapping** to achieve per-contract isolation:
+**Key architectural patterns:**
 
-- **Dynamic validation**: `.expand()` creates one task per contract. Each runs independently; failure in one doesn't block others.
-- **Parallel provisioning**: Within a `TaskGroup`, schema registration and table creation both run concurrently for all contracts—if you have 100 contracts, you get 100 register tasks and 100 create tasks running in parallel.
-- **Per-contract isolation**: Each dynamic task instance processes one contract. Airflow UI shows each contract's individual status, making debugging trivial.
-- **Result aggregation**: `xcom_pull()` collects results from all dynamic instances into a unified report without manual looping.
-- **GitHub integration**: Report includes per-contract status, giving developers clear visibility into which contracts succeeded and which failed.
+- **Dynamic task expansion**: `.expand()` with `fetch_task.output.map()` creates one task instance per contract. The Airflow UI shows each separately.
+- **Sequential per-contract provisioning**: Schema registration runs after validation for each contract, and table creation depends on schema registration succeeding. This guarantees the schema exists before creating the table.
+- **Parallel across contracts**: With 100 contracts, Airflow creates 100 validate tasks, 100 register tasks, and 100 create tasks that run concurrently (limited by executor parallelism).
+- **TaskGroups for organization**: Schema and table provisioning tasks are grouped for cleaner UI and logical separation.
+- **Result aggregation via xcom_pull**: The collect task pulls results from all dynamic instances (not individual tasks) into lists, then processes them as a batch.
+- **Failure isolation**: If contract-A's table creation fails, contracts B through Z still complete successfully. The aggregation step captures partial results.
 
 ## Key Design Decisions
 
-### 1. **Composing Production-Grade Solutions**
+### 1. **Dynamic Task Mapping for Per-Contract Isolation**
 
-Rather than building schema validation and table creation from scratch, we're leveraging:
+Airflow's `.expand()` method enables one critical pattern: creating one task instance per contract without manual loops.
+
+```python
+# One validation task per contract
+validate_tasks = PythonOperator.partial(
+    task_id='validate_contract',
+    python_callable=task_validate_contract,
+).expand(
+    op_args=fetch_task.output.map(lambda x: [x])  # Map each contract to a task
+)
+```
+
+**Why this matters:**
+
+- **Failure isolation**: If contract-A fails validation, contracts B–Z still run. One contract's failure doesn't cascade.
+- **Native visibility**: Airflow UI shows each contract separately—you can click into any contract's task instance to see logs, XCom values, and retry history.
+- **Parallel execution**: All 100 validation tasks (or 100 register tasks) run concurrently, limited only by executor parallelism. No manual threading or process pools needed.
+- **Result aggregation**: XCom lets child tasks (like `collect_task`) pull results from *all* dynamic instances in one call: `xcom_pull(task_ids="validate_contract")` returns a list.
+
+### 2. **Sequential Per-Contract Provisioning (Schema → Table)**
+
+Rather than running schema registration and table creation in parallel for each contract, the refactored DAG sequences them:
+
+```
+validate_task[contract_1] 
+  → register_task[contract_1] 
+    → create_table_task[contract_1]
+```
+
+But across contracts, they're parallel:
+
+```
+validate_task[1..N] (all N run concurrently)
+  → register_task[1..N] (all N run concurrently, after validation)
+    → create_table_task[1..N] (all N run concurrently, after registration)
+```
+
+**Benefits:**
+
+- **Guarantees consistency**: Schema always exists before table creation attempts it.
+- **Simplified error handling**: Clear causality—table creation fails only if schema registration failed, not due to a race condition.
+- **Reduced AWS API contention**: Sequential per-contract means fewer concurrent AWS Glue API calls per contract (though still highly parallel across contracts).
+
+### 3. **Composing Production-Grade Solutions**
+
+Rather than building schema validation and table creation from scratch, leverage:
 
 - **AWS Glue Schema Registry** for schema versioning, compatibility checking, and schema evolution.
 - **AWS Glue Catalog** for table metadata and Iceberg integration.
@@ -341,16 +313,16 @@ Rather than building schema validation and table creation from scratch, we're le
 
 Each tool is mature and battle-tested. The integration layer—our DAG tasks—is thin and focused on orchestration, not reimplementing features these services already provide.
 
-### 2. **Hexagonal Architecture for Decoupling**
+### 4. **Hexagonal Architecture for Decoupling**
 
 The contract processing logic lives in library modules, independent of Airflow:
 
 ```
 airflow/
 ├── dags/
-│   └── contract_provisioning_dag.py  # DAG definition
+│   └── contract_provisioning_dag.py  # DAG definition (orchestration only)
 ├── tasks/
-│   ├── contract_tasks.py             # Contract validation logic
+│   ├── contract_tasks.py             # Contract validation logic (business logic)
 │   └── github_tasks.py               # GitHub integration
 └── lib/
     ├── models.py                     # Data models (Contract, ValidationResult)
@@ -360,45 +332,45 @@ airflow/
     └── exceptions.py                 # Custom exceptions
 ```
 
-This structure means:
+This separation ensures:
 
-- **Testability**: Validation and conversion logic can be tested independently of Airflow.
-- **Reusability**: GitHub Actions workflows can import and use the same validation library without spinning up Airflow.
-- **Portability**: If you later replace Airflow with Step Functions or Prefect, the core logic remains unchanged.
+- **Testability**: Validation logic runs in unit tests without Airflow.
+- **Reusability**: GitHub Actions workflows can import the same libraries.
+- **Portability**: Replace Airflow with Step Functions or Prefect without rewriting core logic.
 
-### 3. **Airflow Variables for Configuration**
+### 5. **Airflow Variables for Configuration**
 
-Rather than hardcoding paths and credentials, use Airflow variables:
+Use Airflow variables instead of hardcoding:
 
 ```python
 Variable.get("contracts_dir", "contracts/current")
+Variable.get("repo_path", "/app")
 Variable.get("github_token")
 Variable.get("github_repo")
 Variable.get("aws_glue_registry_name", "default-registry")
 ```
 
-This allows teams to change configuration without modifying the DAG code—a key requirement for production systems where data engineers own the DAG but ops teams own infrastructure.
+This decouples DAG code from infrastructure configuration. Data engineers own the DAG; ops teams own the variables.
 
-### 4. **Failure Handling and Observability**
+### 6. **Graceful Partial Failure Handling**
 
-Airflow provides built-in retry and alert mechanisms:
+The aggregation step handles contracts that failed at different stages:
 
 ```python
-default_args = {
-    'owner': 'data-platform',
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
-    'on_failure_callback': notify_slack,  # Custom alert function
-}
+aggregated = ContractTasks.collect_results(
+    validation_results,      # Some may have error=True
+    schema_results,          # Some may be None (validation failed)
+    table_results            # Some may be None (schema registration failed)
+)
 ```
 
-When a schema registration fails, the task retries automatically. If it fails after retries, the alert fires immediately—giving teams visibility without manual polling.
+The GitHub comment reports per-contract status, showing which contracts succeeded and which failed (and at which stage). Teams get visibility into the exact point of failure without needing to dig through logs.
 
 ## Real-World Flow: Adding a New Contract
 
-Here's what happens when a developer adds a new contract to the repository:
+Here's what happens when a developer adds a new contract:
 
-1. **Developer creates contract file**:
+1. **Developer creates and commits contract file**:
    ```bash
    mkdir -p contracts/current/users/01
    cat > contracts/current/users/01/users.json << 'EOF'
@@ -414,30 +386,68 @@ Here's what happens when a developer adds a new contract to the repository:
      ]
    }
    EOF
+   git add contracts/current/users/01/users.json
+   git commit -m "add users contract v1"
+   git push
    ```
 
-2. **Developer pushes to GitHub** and creates a pull request.
+2. **GitHub Actions workflow triggers** (listening for changes to `contracts/current/**`).
 
-3. **GitHub Actions workflow triggers** (configured to listen for changes to `contracts/current/**`).
+3. **Workflow invokes Airflow DAG** with context:
+   - `github_pr_number`: The PR that triggered the workflow
+   - `changed_files`: List of contract files changed (only these are processed)
+   - `repo_path`: Path to repository clone
 
-4. **Airflow DAG is triggered** with PR metadata:
-   - Fetches all contracts in `contracts/current/`
-   - Validates JSON schema and required fields
-   - Registers AVRO schemas in AWS Glue
-   - Creates corresponding Iceberg tables
-   - Collects results (pass/fail per contract)
+4. **Airflow DAG executes with per-contract isolation**:
+   
+   a) **Fetch**: Lists all changed contract files → `[users.json]`
+   
+   b) **Validate** (dynamic): Creates `validate_contract[0]` task (one per contract)
+      - Reads JSON, checks required fields, validates column types
+      - Logs: `✅ Validated users-v1`
+      - Returns: `{contract_id: "users-v1", columns: [...], status: "valid"}`
+   
+   c) **Register Schema** (dynamic): Creates `register_schema[0]` task
+      - Converts contract to AVRO schema
+      - Calls `glue.create_schema(SchemaName="users-v1", ...)`
+      - Logs: `✅ Registered schema for users-v1`
+      - Returns: `{contract_id: "users-v1", schema_arn: "...", status: "registered"}`
+      - **If this fails**, the table creation task is skipped for this contract (but other contracts still process)
+   
+   d) **Create Table** (dynamic): Creates `create_table[0]` task
+      - Converts schema columns to Glue table format
+      - Calls `glue.create_table(DatabaseName="contracts", TableType="ICEBERG", ...)`
+      - Logs: `✅ Created table for users-v1`
+      - Returns: `{contract_id: "users-v1", location: "s3://bucket/iceberg/users-v1/", status: "created"}`
+   
+   e) **Aggregate Results**: Collects all results into a report:
+      ```
+      {
+        "schemas_registered": 1,
+        "tables_created": 1,
+        "results": [
+          {
+            "contract_id": "users-v1",
+            "validation": {"status": "valid"},
+            "schema": {"status": "registered"},
+            "table": {"status": "created"}
+          }
+        ]
+      }
+      ```
 
-5. **GitHub gets a comment** showing provisioning status:
+5. **GitHub PR gets a comment** with per-contract status:
    ```
    ✅ Contract Provisioning Results
    
-   users-v1: ✓ Valid | ✓ Schema Registered | ✓ Table Created
-   products-v2: ✓ Valid | ✓ Schema Registered | ✓ Table Created
+   **Summary**: 1 schema registered, 1 table created
    
-   All contracts provisioned successfully!
+   | Contract | Validation | Schema | Table |
+   |----------|-----------|--------|-------|
+   | users-v1 | ✓ | ✓ | ✓ |
    ```
 
-6. **Developer approves PR** with confidence—the contracts are already in production infrastructure.
+6. **Developer approves PR** with confidence—schema and table are ready in production. The next data pipeline can start writing to `contracts.users_v1`.
 
 ## Advantages Over Microservices
 
@@ -493,8 +503,15 @@ make airflow-trigger
 
 ## Conclusion
 
-Data contracts enforce trust in data pipelines, but enforcement requires orchestration. Rather than building custom systems or deploying microservices, leverage Airflow's native orchestration and compose production-grade AWS services.
+Data contracts enforce trust in data pipelines, but enforcement requires orchestration. Rather than building custom systems or deploying microservices, leverage Airflow's dynamic task mapping and compose production-grade AWS services.
 
-This approach trades simplicity for power: you get a single, auditable workflow that scales, retries gracefully, and integrates seamlessly with existing infrastructure. The DAG becomes the contract-processing system—no additional services, no additional operational burden.
+**The key insight from this refactoring:** Per-contract isolation through dynamic task expansion eliminates the need for manual batch loops, thread pools, or custom parallelism code. Airflow handles it natively:
 
-The pattern works for any centralized data governance requirement: schema validation, data quality checks, access control provisioning, metadata enrichment. Start with contracts; extend the DAG.
+- **One task instance per contract**: Failure isolation, clear UI visibility, independent retry logic.
+- **Sequential provisioning per contract**: Schema registration before table creation ensures consistency.
+- **Parallel across contracts**: All contracts process concurrently within executor limits.
+- **Built-in result aggregation**: XCom and dynamic task outputs make collecting per-contract results trivial.
+
+This approach scales to hundreds of contracts and integrates seamlessly with existing infrastructure. The DAG becomes the contract-processing system—no additional services, no additional operational burden, no custom orchestration logic to maintain.
+
+The pattern generalizes to any data governance requirement: schema validation, data quality checks, access control provisioning, metadata enrichment. Start with contracts; extend the DAG with additional dynamic tasks as your governance needs grow.

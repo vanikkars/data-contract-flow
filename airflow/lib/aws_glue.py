@@ -15,6 +15,7 @@ from lib.exceptions import (
     TableNotFoundError,
 )
 from lib.converters import contract_to_avro
+from lib.schema_validator import SchemaSafetyValidator, DownstreamImpactAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -22,17 +23,21 @@ logger = logging.getLogger(__name__)
 class AwsGlueAdapter:
     """Unified adapter for AWS Glue Schema Registry and Iceberg operations."""
 
-    def __init__(self, region: str = None, registry_name: str = None):
+    def __init__(self, region: str = None, registry_name: str = None, enforce_sql_safety: bool = True):
         """Initialize the adapter.
 
         Args:
             region: AWS region (defaults to AWS_DEFAULT_REGION env var or us-east-1)
             registry_name: Name of Glue Schema Registry (defaults to schema-registry)
+            enforce_sql_safety: If True, enforce SQL-safety checks on schema changes
         """
         self.region = region or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
         self.registry_name = registry_name or os.getenv("TF_VAR_registry_name", "schema-registry")
         self.glue = boto3.client("glue", region_name=self.region)
         self.sts = boto3.client("sts", region_name=self.region)
+        self.enforce_sql_safety = enforce_sql_safety
+        self.sql_validator = SchemaSafetyValidator(strict_mode=enforce_sql_safety)
+        self.impact_analyzer = DownstreamImpactAnalyzer(self.glue)
 
     # ============================================================================
     # Schema Registry Operations
@@ -43,6 +48,7 @@ class AwsGlueAdapter:
         contract: DataContract,
         data_format: str = "AVRO",
         compatibility: str = "FORWARD_ALL",
+        enforce_sql_safety: bool = None,
     ) -> str:
         """Register a data contract as a schema in the registry.
 
@@ -50,17 +56,21 @@ class AwsGlueAdapter:
             contract: The data contract to register
             data_format: Schema format (AVRO, PROTOBUF, JSON)
             compatibility: Compatibility mode (BACKWARD, FORWARD, BOTH, FORWARD_ALL, DISABLED)
+            enforce_sql_safety: If True, enforce SQL-safety checks (overrides instance setting)
 
         Returns:
             Schema ARN
 
         Raises:
             RegistryNotFoundError: If registry does not exist
-            ValueError: If schema registration fails
+            ValueError: If schema registration fails or SQL-safety violated
         """
         schema_name = contract.contract_id
         description = contract.description or f"Schema for {schema_name}"
         schema_definition = contract_to_avro(contract)
+
+        # Use instance setting if not overridden
+        enforce_sql_safety = enforce_sql_safety if enforce_sql_safety is not None else self.enforce_sql_safety
 
         try:
             registry = self.glue.get_registry(
@@ -110,6 +120,44 @@ class AwsGlueAdapter:
 
                 if current_schema_def != schema_definition:
                     logger.info(f"📝 Schema definition CHANGED for {schema_name}")
+
+                    # SQL-SAFETY VALIDATION (NEW)
+                    if enforce_sql_safety:
+                        current_schema = json.loads(current_schema_def)
+                        new_schema = json.loads(schema_definition)
+
+                        is_sql_safe, sql_violations = self.sql_validator.validate_schema_change(
+                            current_schema, new_schema, compatibility
+                        )
+
+                        if not is_sql_safe:
+                            error_summary = "\n".join(
+                                f"  [{v['type'].upper()}] {v['message']}"
+                                for v in sql_violations
+                                if v["type"] == "error"
+                            )
+                            logger.error(f"❌ SQL-Safety violations for {schema_name}:\n{error_summary}")
+
+                            raise ValueError(
+                                f"Schema change violates SQL-safety requirements. "
+                                f"Changes could break downstream SQL queries:\n{error_summary}"
+                            )
+
+                        # Log warnings but continue
+                        warnings = [v for v in sql_violations if v["type"] == "warning"]
+                        if warnings:
+                            logger.warning(f"⚠️  SQL-Safety warnings for {schema_name}:")
+                            for v in warnings:
+                                logger.warning(f"  [WARNING] {v['message']}")
+
+                        # Analyze downstream impact
+                        impact = self.impact_analyzer.analyze_impact(schema_name)
+                        if impact["affected_tables"]:
+                            logger.info(
+                                f"📊 This change affects {len(impact['affected_tables'])} table(s): "
+                                f"{', '.join(t['name'] for t in impact['affected_tables'])}"
+                            )
+
                     try:
                         version_result = self.glue.register_schema_version(
                             SchemaId={
