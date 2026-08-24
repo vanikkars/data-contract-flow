@@ -15,12 +15,6 @@
       "data_type": "string",
       "nullable": false,
       "description": "Email address of the user"
-    },
-    {
-      "name": "date_of_birth",
-      "data_type": "date",
-      "nullable": false,
-      "description": "Date of birth in YYYY-MM-DD format"
     }
   ],
   "metadata": {
