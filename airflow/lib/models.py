@@ -98,6 +98,22 @@ class Column:
         }
 
 
+# Iceberg table properties required for safe schema evolution on the raw layer.
+#
+# format-version 2 is the baseline for reliable column-level evolution.
+#
+# Metadata retention is the load-bearing setting: an Iceberg table holds data
+# written under every historical schema version, so reasoning about "which
+# snapshot had which schema" during an evolution review requires that the
+# metadata history still exists. Deleting metadata after commit destroys the
+# evidence needed to answer that question.
+ICEBERG_SAFETY_PROPERTIES = {
+    "format-version": "2",
+    "write.metadata.delete-after-commit.enabled": "false",
+    "write.metadata.previous-versions-max": "100",
+}
+
+
 @dataclass
 class IcebergTable:
     """Iceberg table domain model."""
@@ -140,6 +156,7 @@ class IcebergTable:
             "created_at": self.created_at.isoformat(),
             "data_owner": self.data_owner or "Unknown",
             "data_steward": self.data_steward or "Unknown",
+            **ICEBERG_SAFETY_PROPERTIES,
         }
 
 

@@ -2,7 +2,7 @@
   "contract_id": "users-v1",
   "name": "Users",
   "description": "Schema for user records",
-  "version": "1.0.1",
+  "version": "1.0.4",
   "columns": [
     {
       "name": "user_name",
@@ -17,10 +17,10 @@
       "description": "Email address of the user"
     },
     {
-      "name": "date_of_birth",
-      "data_type": "date",
-      "nullable": false,
-      "description": "Date of birth in YYYY-MM-DD format"
+      "name": "phone_number",
+      "data_type": "string",
+      "nullable": true,
+      "description": "Phone number of the user"
     }
   ],
   "metadata": {

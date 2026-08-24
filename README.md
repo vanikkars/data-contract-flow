@@ -1,6 +1,55 @@
 # Data Contract Flow
 
-A contract-driven data pipeline orchestration system using Apache Airflow, AWS Glue Schema Registry, and Iceberg tables. Automatically validates, registers, and provisions data contracts through a scalable DAG-based workflow.
+A contract-driven data pipeline orchestration system using Apache Airflow, AWS Glue Schema Registry, and Iceberg tables. Automatically validates, registers, and provisions data contracts through a scalable DAG-based workflow with **SQL-safe schema evolution**.
+
+> **New in v2.1:** Registry defaults hardened to `FULL_ALL` and AVRO logical-type validation added — catching decimal and timestamp changes that Glue reports as compatible while silently corrupting data. See [Latest Release](#-latest-release-registry-hardening--logical-types-v210) below.
+
+## 🆕 Latest Release: Registry Hardening & Logical Types (v2.1.0)
+
+Two layers of defence added ahead of the SQL-safety validator, closing the gaps where **AWS Glue reports a change as compatible while it silently corrupts data**.
+
+### Layer 0 — Registry & Iceberg defaults
+
+| Change | Before | After |
+|--------|--------|-------|
+| **Default compatibility mode** | `FORWARD_ALL` | **`FULL_ALL`** |
+| **Weak mode usage** | Silent | Logged with the specific risk it carries |
+| **Iceberg table properties** | Unset | format-v2 + metadata retained after commit |
+
+`FORWARD_ALL` permitted *adding required fields*. `FULL_ALL` forbids both that and *field removal*, and checks transitively against every prior schema version — which matters because an Iceberg table holds data written under every historical version, not just the latest.
+
+### Layer 1 — AVRO logical type safety
+
+These changes all pass AVRO compatibility because the physical type never changes (`bytes` for decimal, `long` for timestamp). The corruption is silent:
+
+| Change | Verdict | Why AVRO misses it |
+|--------|---------|--------------------|
+| `DECIMAL(18,4)` → `DECIMAL(10,2)` | ❌ **Error** | Both are `bytes`; scale change rescales every stored value |
+| `DECIMAL(18,4)` → `DECIMAL(10,4)` | ❌ **Error** | Both are `bytes`; precision narrowing truncates |
+| `DECIMAL(10,2)` → `DECIMAL(18,2)` | ✅ Safe | Widening at equal scale loses nothing |
+| `timestamp-millis` → `timestamp-micros` | ❌ **Error** | Both are `long`; every timestamp shifts by 1000× |
+| Logical type added/removed | ❌ **Error** | Same bytes, reinterpreted meaning |
+
+**Tests:** `airflow/tests/test_layer0_compatibility.py` (14), `airflow/tests/test_layer1_logical_types.py` (19).
+
+**Scope note:** dbt-side protections (generated `sources.yml`, staging-layer `select *` lint) are **deliberately not implemented here** — they operate on files in the consumer's dbt repo. The design is documented in [COMPATIBILITY_VS_SQL_SAFETY_DBT.md](COMPATIBILITY_VS_SQL_SAFETY_DBT.md) for that team.
+
+---
+
+## Previous Release: Critical Bug Fixes (v2.0.1)
+
+Three critical bugs in the SQL-safety validator have been fixed:
+
+| Bug | Issue | Fix | Impact |
+|-----|-------|-----|--------|
+| **#1** | Type widening blocked (int→long) | Engine-aware validation (Iceberg allows) | ✅ Unblocks schema evolution |
+| **#2** | Rename detection used position heuristic | Semantic analysis with doc markers | ✅ No false positives/negatives |
+| **#3** | Reserved words case-insensitive | Case-insensitive checking for all variants | ✅ Catches SELECT, Select, select |
+| **#4** | Nullable→non-nullable not detected | New validation check added | ✅ Prevents data loss |
+
+**See:** [BUG_FIXES_QUICK_REFERENCE.md](BUG_FIXES_QUICK_REFERENCE.md) for details on each fix.
+
+---
 
 ## Quick Start
 
@@ -24,15 +73,82 @@ open http://localhost:8080
 make airflow-trigger
 ```
 
+## 🆕 SQL-Safety Features
+
+**Problem:** Schema registries validate AVRO compatibility, not SQL queries. Changes that pass validation can still break production queries.
+
+**Solution:** SQL-safety validation layer that catches ~80% of breaking changes at registration time.
+
+### What Gets Validated
+
+#### Level 1: Blocked Changes (Errors)
+```python
+❌ Field removal                          → Use deprecation (30-day grace period)
+❌ Field renaming                         → Document with "renamed from X" marker
+❌ Adding required field without default  → Add a default value
+❌ Type narrowing (long→int)             → Data loss risk
+❌ Nullable→non-nullable promotion       → Existing NULLs become unreadable
+❌ SQL reserved word conflicts           → Use backticks or alias
+❌ Decimal precision/scale narrowing     → Silent truncation & rescaling
+❌ Timestamp unit change (millis↔micros) → Every value shifts by 1000×
+❌ Logical type added or removed         → Same bytes, different meaning
+```
+
+#### Level 2: Warning Changes (Safe but need planning)
+```python
+⚠️  Type changes requiring migration     → Safe direction but needs backfill
+⚠️  Column reordering                    → Use explicit column names
+⚠️  New required field with default      → Needs backfill of old rows
+```
+
+#### Level 3: Safe Changes (Auto-Allowed)
+```python
+✅ Add optional field                    → Register immediately
+✅ Mark field as DEPRECATED              → Gives consumers time to migrate
+✅ Add computed field                    → No data impact
+✅ Type widening (Iceberg)              → Metadata-only change
+✅ Decimal precision widening            → Safe at equal scale
+```
+
+### Example: Safe vs Unsafe Evolution
+
+```python
+# ✅ SAFE: Add optional field
+v1 = {"fields": [{"name": "user_id", "type": "string"}]}
+v2 = {"fields": [
+    {"name": "user_id", "type": "string"},
+    {"name": "email", "type": ["null", "string"], "default": None}
+]}
+
+# ❌ UNSAFE: Remove field
+v1 = {"fields": [{"name": "user_id", "type": "string"}, {"name": "deprecated", "type": "string"}]}
+v2 = {"fields": [{"name": "user_id", "type": "string"}]}
+# Solution: Mark as DEPRECATED first (v1.1), remove in v2.0 after 30+ days
+
+# ⚠️ NEEDS MIGRATION: Type widening (Iceberg)
+v1 = {"fields": [{"name": "count", "type": "int"}]}
+v2 = {"fields": [{"name": "count", "type": "long"}]}
+# Iceberg allows this as metadata-only change (no table recreation needed)
+
+# ❌ UNSAFE: Decimal narrowing — AVRO says compatible, money silently truncates
+decimal = lambda p, s: {"type": "bytes", "logicalType": "decimal",
+                        "precision": p, "scale": s}
+v1 = {"fields": [{"name": "price", "type": decimal(18, 4)}]}
+v2 = {"fields": [{"name": "price", "type": decimal(10, 2)}]}
+# Both are `bytes` to AVRO, so the registry approves it.
+# Every value above 99,999,999.99 is truncated; every value is rescaled.
+```
+
 ## What It Does
 
 The `contract_provisioning` DAG orchestrates a complete contract lifecycle:
 
 1. **Fetch Contracts** — Discover contract files in `contracts/current/`
 2. **Validate** — Verify JSON schema, required fields, and data types
-3. **Register Schemas** — Create AVRO schemas in AWS Glue Schema Registry
-4. **Create Tables** — Provision Iceberg tables in AWS Glue Catalog
-5. **Report Results** — Comment on GitHub PRs with provisioning status
+3. **Validate SQL-Safety** — Check for breaking changes to downstream queries
+4. **Register Schemas** — Create AVRO schemas in AWS Glue Schema Registry with SQL-safety checks
+5. **Create Tables** — Provision Iceberg tables in AWS Glue Catalog
+6. **Report Results** — Comment on GitHub PRs with provisioning status
 
 ## Architecture
 
@@ -41,7 +157,9 @@ Airflow 3.3.0
 ├── contract_provisioning (DAG)
 │   ├── fetch_contracts
 │   ├── validate_contracts
+│   ├── validate_sql_safety          ← NEW: Prevents breaking changes
 │   ├── register_schemas (parallel)
+│   │   └── [with SQL-safety checks]
 │   ├── create_iceberg_tables (parallel)
 │   ├── collect_and_format_results
 │   └── report_to_github
@@ -51,11 +169,67 @@ Airflow 3.3.0
 
 AWS Services
 ├── Glue Schema Registry
+│   └── SchemaSafetyValidator        ← NEW: SQL-safety validation
 └── Glue Catalog (Iceberg tables)
 
 GitHub Actions
 └── Triggers DAG when contracts/current/** changes
 ```
+
+### SQL-Safety Validation Flow
+
+```
+Schema Change Registration
+    │
+    ├─→ [0] Check compatibility mode                      ← Layer 0
+    │   └─ Weaker than FULL_ALL? → Warn with the risk it carries
+    │
+    ├─→ [1] Fetch old schema version
+    │
+    ├─→ [2] Validate SQL-Safety
+    │   ├─ Check field removals
+    │   ├─ Check logical types (decimal, timestamp)       ← Layer 1
+    │   │   ├─ Decimal precision / scale
+    │   │   ├─ Timestamp unit shifts (millis ↔ micros)
+    │   │   └─ Logical type added / removed
+    │   ├─ Check type changes (engine-aware)
+    │   ├─ Check new required fields
+    │   ├─ Check column reordering
+    │   ├─ Check reserved words
+    │   ├─ Check field renames
+    │   └─ Check nullable promotions
+    │
+    ├─→ [3] Analyze Downstream Impact
+    │   ├─ Find affected tables
+    │   └─ Assess migration complexity
+    │
+    ├─→ [4] AVRO Compatibility Check
+    │   └─ Glue's native validation (FULL_ALL by default)
+    │
+    ├─→ [5] Register Schema
+    │   └─ Create new version in registry
+    │
+    └─→ [6] Report Results
+        ├─ Violations found? → Block with clear errors
+        └─ Safe? → Register and notify consumers
+```
+
+**Why logical types are checked first:** they sit on top of a physical base type, so a plain base-type comparison sees `bytes → bytes` or `long → long` and waves the change straight through.
+
+## 📖 SQL-Safety Documentation
+
+**Want to understand how it all works?** Read the comprehensive guides:
+
+| Document | Purpose | Audience |
+|----------|---------|----------|
+| **[SQL_SAFETY_LOGIC_EXPLAINED.md](SQL_SAFETY_LOGIC_EXPLAINED.md)** | Deep dive into all 7 validation checks with examples | Engineers, Architects |
+| **[COMPATIBILITY_VS_SQL_SAFETY_DBT.md](COMPATIBILITY_VS_SQL_SAFETY_DBT.md)** | Why compatibility modes ≠ SQL safety, and the layered architecture for protecting dbt consumers | Architects, Analytics Engineers |
+| **[BUG_FIXES_QUICK_REFERENCE.md](BUG_FIXES_QUICK_REFERENCE.md)** | Quick reference for the bug fixes applied | All users |
+| **[FIXES_APPLIED.md](FIXES_APPLIED.md)** | Detailed technical explanation of what was fixed | Developers |
+| **[README_SQL_SAFETY.md](README_SQL_SAFETY.md)** | Quick start guide for SQL-safety features | All users |
+| **[SCHEMA_EVOLUTION_CHECKLIST.md](SCHEMA_EVOLUTION_CHECKLIST.md)** | Operational checklist for schema changes | Data Producers |
+
+**Start here:** [SQL_SAFETY_LOGIC_EXPLAINED.md](SQL_SAFETY_LOGIC_EXPLAINED.md) for the complete logic explanation.
 
 ## Project Structure
 
@@ -68,11 +242,17 @@ airflow/
 │   ├── contract_tasks.py               # Contract validation & provisioning logic
 │   └── github_tasks.py                 # GitHub integration
 ├── lib/
-│   ├── aws_glue.py                     # AWS Glue SDK wrapper
-│   ├── models.py                       # Data models
-│   ├── validator.py                    # Schema validation
+│   ├── aws_glue.py                     # AWS Glue SDK wrapper + compatibility policy
+│   ├── schema_validator.py             # SQL-safety validation (incl. logical types)
+│   ├── models.py                       # Data models + Iceberg table properties
+│   ├── validator.py                    # Contract validation
 │   ├── converters.py                   # Contract converters
 │   └── exceptions.py                   # Custom exceptions
+├── tests/
+│   ├── test_schema_validator.py        # SQL-safety validator tests
+│   ├── test_bug_fixes.py               # Regression tests for v2.0.1 fixes
+│   ├── test_layer0_compatibility.py    # Compatibility mode & Iceberg properties
+│   └── test_layer1_logical_types.py    # Decimal & timestamp logical types
 └── docker/
     └── airflow-entrypoint.sh           # Airflow startup script
 
@@ -635,6 +815,10 @@ docker-compose -f docker-compose.airflow.yml exec airflow-webserver \
 
 ## Roadmap
 
+- [x] Registry compatibility hardened to `FULL_ALL` (v2.1.0)
+- [x] AVRO logical type validation — decimal & timestamp (v2.1.0)
+- [ ] Downstream impact analysis from dbt `manifest.json` — reports which consumer models a contract change breaks, before merge
+- [ ] Publish contracts to a consumable location so dbt repos can generate their own sources
 - [ ] GitHub PR comment integration (currently placeholder)
 - [ ] Slack notifications on failures
 - [ ] Async table creation for better performance

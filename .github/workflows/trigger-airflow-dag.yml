@@ -6,10 +6,21 @@ on:
       - 'contracts/current/**'
       - '.github/workflows/trigger-airflow-dag.yml'
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      process_all:
+        description: 'Process all contracts instead of just changed ones'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   pull-requests: write
   contents: read
+  checks: write
 
 env:
   AIRFLOW_DAG_ID: contract_provisioning
@@ -40,12 +51,21 @@ jobs:
       - name: Check if contracts changed
         id: check-contracts
         run: |
-          if [ -z "${{ steps.changed-files.outputs.files }}" ]; then
-            echo "::notice::No contract files changed, skipping DAG trigger"
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-          else
+          PROCESS_ALL="${{ github.event.inputs.process_all }}"
+          CHANGED_FILES="${{ steps.changed-files.outputs.files }}"
+
+          # If process_all flag is set (manual trigger), always proceed
+          if [ "$PROCESS_ALL" = "true" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "📋 process_all=true, will process all contracts"
+          # If changed files exist, proceed
+          elif [ -n "$CHANGED_FILES" ]; then
             echo "has_changes=true" >> $GITHUB_OUTPUT
             echo "📋 Found changed contracts, will trigger Airflow DAG"
+          # Otherwise skip
+          else
+            echo "::notice::No contract files changed and process_all not set, skipping DAG trigger"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Trigger Airflow DAG
@@ -65,6 +85,12 @@ jobs:
 
           echo "🚀 Triggering Airflow DAG at $AIRFLOW_URL"
 
+          # Determine process_all flag (true if workflow_dispatch with process_all=true, false otherwise)
+          PROCESS_ALL="${{ github.event.inputs.process_all }}"
+          if [ -z "$PROCESS_ALL" ]; then
+            PROCESS_ALL="false"
+          fi
+
           # Trigger DAG with GitHub context (using API v1 for Airflow 2.11)
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "$AIRFLOW_URL/api/v1/dags/${{ env.AIRFLOW_DAG_ID }}/dagRuns" \
@@ -75,7 +101,9 @@ jobs:
             "conf": {
               "github_pr_number": ${{ github.event.pull_request.number }},
               "github_repo": "${{ github.repository }}",
-              "github_token": "${{ secrets.GITHUB_TOKEN }}"
+              "github_token": "${{ secrets.GITHUB_TOKEN }}",
+              "changed_files": "${{ steps.changed-files.outputs.files }}",
+              "process_all": "$PROCESS_ALL"
             }
           }
           EOF
@@ -204,22 +232,7 @@ jobs:
           echo "XCom Response: $XCOM_RESPONSE"
 
           # Extract comment body using Python JSON parsing
-          COMMENT_BODY=$(echo "$XCOM_RESPONSE" | python3 << 'PYTHON_EOF'
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    if isinstance(data, list) and len(data) > 0:
-        value = data[0].get('value', {})
-        if isinstance(value, dict):
-            print(value.get('body', ''))
-        else:
-            print(str(value))
-    else:
-        print('')
-except:
-    print('')
-PYTHON_EOF
-          )
+          COMMENT_BODY=$(echo "$XCOM_RESPONSE" | python3 -c "import sys, json; data = json.load(sys.stdin); value = data[0].get('value', {}) if isinstance(data, list) and len(data) > 0 else {}; print(value.get('body', '') if isinstance(value, dict) else str(value) if value else '')" 2>/dev/null || echo "")
 
           if [ -z "$COMMENT_BODY" ]; then
             echo "::warning::Could not extract comment body from XCom, using fallback message"
@@ -232,45 +245,57 @@ PYTHON_EOF
           cat /tmp/comment_body.txt >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
+          # Save DAG run URL for later use.
+          #
+          # Airflow 2.x addresses a specific run through the grid view with the
+          # run id as a query parameter, not as a path segment:
+          #   /dags/<dag_id>/grid?dag_run_id=<encoded>
+          #
+          # The run id contains ':' and '+' (e.g.
+          # manual__2026-08-24T13:02:57.288406+00:00). Left raw, the '+' is
+          # decoded as a space and the link resolves to no run at all, so the
+          # id must be percent-encoded.
+          ENCODED_RUN_ID=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$DAG_RUN_ID")
+          DAG_RUN_URL="$AIRFLOW_URL/dags/${{ env.AIRFLOW_DAG_ID }}/grid?dag_run_id=$ENCODED_RUN_ID"
+          echo "dag_run_url=$DAG_RUN_URL" >> $GITHUB_OUTPUT
+
           echo "✅ Results fetched successfully"
 
       - name: Comment on PR with results
         if: steps.check-contracts.outputs.has_changes == 'true'
         uses: actions/github-script@v7
+        env:
+          COMMENT_BODY: ${{ steps.fetch-results.outputs.comment_body }}
+          DAG_RUN_URL: ${{ steps.fetch-results.outputs.dag_run_url }}
+          DAG_RUN_ID: ${{ steps.trigger-dag.outputs.dag_run_id }}
         with:
           script: |
-            const fs = require('fs');
-            const commentBody = `${{ steps.fetch-results.outputs.comment_body }}`;
+            const commentBody = process.env.COMMENT_BODY || '';
+            const dagRunUrl = process.env.DAG_RUN_URL || '';
+            const dagRunId = process.env.DAG_RUN_ID || '';
 
+            let finalComment;
             if (!commentBody.trim()) {
               core.warning('Comment body is empty, using minimal message');
-              const fallbackComment = `
-                ✅ Contract provisioning completed!
-
-                - DAG Run ID: ${{ steps.trigger-dag.outputs.dag_run_id }}
-                - View details in Airflow UI: ${{ secrets.AIRFLOW_URL }}/dags/${{ env.AIRFLOW_DAG_ID }}/runs
-              `;
-
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: fallbackComment
-              });
+              finalComment = `## ✅ Contract Provisioning Completed\n\n**DAG Run ID:** \`${dagRunId}\`\n\n**View Details:**\n- [📊 Airflow DAG Run](${dagRunUrl})\n\n---\n*Contract provisioning completed successfully. Check the Airflow UI for detailed logs and execution results.*`;
             } else {
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: commentBody
-              });
+              finalComment = `## ✅ Contract Provisioning Results\n\n${commentBody}\n\n---\n**Additional Information:**\n- **DAG Run ID:** \`${dagRunId}\`\n- **View Full Details:** [📊 Airflow DAG Run](${dagRunUrl})`;
             }
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: finalComment
+            });
 
             console.log('✅ Comment posted on PR #' + context.issue.number);
 
       - name: Set PR status check
         if: always()
         uses: actions/github-script@v7
+        env:
+          DAG_RUN_URL: ${{ steps.fetch-results.outputs.dag_run_url }}
         with:
           script: |
             const state = '${{ steps.wait-dag.outputs.state }}' === 'success' ? 'success' : 'failure';
@@ -288,6 +313,6 @@ PYTHON_EOF
               output: {
                 title: 'Contract Provisioning via Airflow',
                 summary: description,
-                text: 'View detailed logs in Airflow UI: ${{ secrets.AIRFLOW_URL }}/dags/${{ env.AIRFLOW_DAG_ID }}/runs'
+                text: 'View detailed logs in Airflow UI: ' + (process.env.DAG_RUN_URL || '${{ secrets.AIRFLOW_URL }}/dags/${{ env.AIRFLOW_DAG_ID }}/grid')
               }
             });

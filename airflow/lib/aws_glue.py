@@ -15,24 +15,53 @@ from lib.exceptions import (
     TableNotFoundError,
 )
 from lib.converters import contract_to_avro
+from lib.schema_validator import SchemaSafetyValidator, DownstreamImpactAnalyzer
 
 logger = logging.getLogger(__name__)
+
+# Compatibility modes considered strong enough for a source-aligned raw layer.
+#
+# FULL_ALL forbids both field removal and required-field addition, and checks
+# transitively against every prior version — not just the latest. Transitivity
+# matters for Iceberg because a table retains data written under every
+# historical schema version, so a non-transitive check can approve a change
+# that breaks readers of data still sitting in old snapshots.
+SAFE_COMPATIBILITY_MODES = {"FULL_ALL", "FULL"}
+
+# BACKWARD is the registry default and explicitly permits field deletion, which
+# is a guaranteed downstream SQL break. Kept usable but never silently.
+WEAK_COMPATIBILITY_MODES = {
+    "BACKWARD": "permits field deletion — downstream SQL queries will fail",
+    "BACKWARD_ALL": "permits field deletion — downstream SQL queries will fail",
+    "FORWARD": "permits adding required fields — INSERT statements will fail",
+    "FORWARD_ALL": "permits adding required fields — INSERT statements will fail",
+    "NONE": "no compatibility checking at all",
+    "DISABLED": "no compatibility checking at all",
+}
+
+DEFAULT_COMPATIBILITY = "FULL_ALL"
 
 
 class AwsGlueAdapter:
     """Unified adapter for AWS Glue Schema Registry and Iceberg operations."""
 
-    def __init__(self, region: str = None, registry_name: str = None):
+    def __init__(self, region: str = None, registry_name: str = None, enforce_sql_safety: bool = True, engine: str = "iceberg"):
         """Initialize the adapter.
 
         Args:
             region: AWS region (defaults to AWS_DEFAULT_REGION env var or us-east-1)
             registry_name: Name of Glue Schema Registry (defaults to schema-registry)
+            enforce_sql_safety: If True, enforce SQL-safety checks on schema changes
+            engine: Target SQL engine (iceberg, athena, redshift, spark)
         """
         self.region = region or os.getenv("AWS_DEFAULT_REGION", "us-east-1")
         self.registry_name = registry_name or os.getenv("TF_VAR_registry_name", "schema-registry")
         self.glue = boto3.client("glue", region_name=self.region)
         self.sts = boto3.client("sts", region_name=self.region)
+        self.enforce_sql_safety = enforce_sql_safety
+        self.engine = engine
+        self.sql_validator = SchemaSafetyValidator(strict_mode=enforce_sql_safety, engine=engine)
+        self.impact_analyzer = DownstreamImpactAnalyzer(self.glue)
 
     # ============================================================================
     # Schema Registry Operations
@@ -42,25 +71,34 @@ class AwsGlueAdapter:
         self,
         contract: DataContract,
         data_format: str = "AVRO",
-        compatibility: str = "FORWARD_ALL",
+        compatibility: str = DEFAULT_COMPATIBILITY,
+        enforce_sql_safety: bool = None,
     ) -> str:
         """Register a data contract as a schema in the registry.
 
         Args:
             contract: The data contract to register
             data_format: Schema format (AVRO, PROTOBUF, JSON)
-            compatibility: Compatibility mode (BACKWARD, FORWARD, BOTH, FORWARD_ALL, DISABLED)
+            compatibility: Compatibility mode. Defaults to FULL_ALL; anything
+                weaker is permitted but logged as a warning (see
+                WEAK_COMPATIBILITY_MODES)
+            enforce_sql_safety: If True, enforce SQL-safety checks (overrides instance setting)
 
         Returns:
             Schema ARN
 
         Raises:
             RegistryNotFoundError: If registry does not exist
-            ValueError: If schema registration fails
+            ValueError: If schema registration fails or SQL-safety violated
         """
         schema_name = contract.contract_id
         description = contract.description or f"Schema for {schema_name}"
         schema_definition = contract_to_avro(contract)
+
+        self._warn_on_weak_compatibility(schema_name, compatibility)
+
+        # Use instance setting if not overridden
+        enforce_sql_safety = enforce_sql_safety if enforce_sql_safety is not None else self.enforce_sql_safety
 
         try:
             registry = self.glue.get_registry(
@@ -110,6 +148,44 @@ class AwsGlueAdapter:
 
                 if current_schema_def != schema_definition:
                     logger.info(f"📝 Schema definition CHANGED for {schema_name}")
+
+                    # SQL-SAFETY VALIDATION (NEW)
+                    if enforce_sql_safety:
+                        current_schema = json.loads(current_schema_def)
+                        new_schema = json.loads(schema_definition)
+
+                        is_sql_safe, sql_violations = self.sql_validator.validate_schema_change(
+                            current_schema, new_schema, compatibility
+                        )
+
+                        if not is_sql_safe:
+                            error_summary = "\n".join(
+                                f"  [{v['type'].upper()}] {v['message']}"
+                                for v in sql_violations
+                                if v["type"] == "error"
+                            )
+                            logger.error(f"❌ SQL-Safety violations for {schema_name}:\n{error_summary}")
+
+                            raise ValueError(
+                                f"Schema change violates SQL-safety requirements. "
+                                f"Changes could break downstream SQL queries:\n{error_summary}"
+                            )
+
+                        # Log warnings but continue
+                        warnings = [v for v in sql_violations if v["type"] == "warning"]
+                        if warnings:
+                            logger.warning(f"⚠️  SQL-Safety warnings for {schema_name}:")
+                            for v in warnings:
+                                logger.warning(f"  [WARNING] {v['message']}")
+
+                        # Analyze downstream impact
+                        impact = self.impact_analyzer.analyze_impact(schema_name)
+                        if impact["affected_tables"]:
+                            logger.info(
+                                f"📊 This change affects {len(impact['affected_tables'])} table(s): "
+                                f"{', '.join(t['name'] for t in impact['affected_tables'])}"
+                            )
+
                     try:
                         version_result = self.glue.register_schema_version(
                             SchemaId={
@@ -289,7 +365,7 @@ class AwsGlueAdapter:
     # Iceberg Table Operations
     # ============================================================================
 
-    async def create_table(self, table: IcebergTable) -> None:
+    def create_table(self, table: IcebergTable) -> None:
         """Create a new Iceberg table.
 
         Args:
@@ -335,7 +411,7 @@ class AwsGlueAdapter:
             logger.error(f"Failed to create table: {str(e)}")
             raise TableCreationError(f"Failed to create table: {str(e)}")
 
-    async def get_table(self, table_name: str, database_name: str = "iceberg_tables") -> Optional[IcebergTable]:
+    def get_table(self, table_name: str, database_name: str = "iceberg_tables") -> Optional[IcebergTable]:
         """Get table from Glue and reconstruct as IcebergTable object."""
         try:
             logger.debug(f"Retrieving table {table_name} from database {database_name}")
@@ -381,7 +457,7 @@ class AwsGlueAdapter:
             logger.error(f"Error retrieving table {table_name}: {str(e)}", exc_info=True)
             return None
 
-    async def table_exists(self, table_name: str, database_name: str = "iceberg_tables") -> bool:
+    def table_exists(self, table_name: str, database_name: str = "iceberg_tables") -> bool:
         """Check if table exists in Glue."""
         try:
             self.glue.get_table(DatabaseName=database_name, Name=table_name)
@@ -392,7 +468,7 @@ class AwsGlueAdapter:
             logger.error(f"Error checking table existence: {str(e)}")
             raise TableCreationError(f"Failed to check table existence: {str(e)}")
 
-    async def update_table(self, table: IcebergTable) -> None:
+    def update_table(self, table: IcebergTable) -> None:
         """Update table schema."""
         try:
             response = self.glue.get_table(
@@ -426,7 +502,7 @@ class AwsGlueAdapter:
             logger.error(f"Failed to update table: {str(e)}")
             raise TableCreationError(f"Failed to update table: {str(e)}")
 
-    async def create_database_if_not_exists(self, database_name: str) -> None:
+    def create_database_if_not_exists(self, database_name: str) -> None:
         """Create database if needed."""
         try:
             self.glue.create_database(DatabaseInput={"Name": database_name})
@@ -440,6 +516,25 @@ class AwsGlueAdapter:
     # ============================================================================
     # Private Helper Methods
     # ============================================================================
+
+    def _warn_on_weak_compatibility(self, schema_name: str, compatibility: str) -> None:
+        """Log a loud warning when registering under a mode weaker than FULL_ALL.
+
+        The mode is not overridden — the caller may have a deliberate reason —
+        but the SQL-safety validator becomes the only thing standing between a
+        weak mode and a downstream break, so the choice is never silent.
+        """
+        mode = (compatibility or "").upper()
+
+        if mode in SAFE_COMPATIBILITY_MODES:
+            return
+
+        reason = WEAK_COMPATIBILITY_MODES.get(mode, "not a recognised strong mode")
+        logger.warning(
+            f"⚠️  Schema '{schema_name}' uses compatibility mode {mode}: {reason}. "
+            f"Recommended: {DEFAULT_COMPATIBILITY}. SQL-safety validation is now the "
+            f"only gate protecting downstream consumers."
+        )
 
     def _wait_for_version_validation(
         self, schema_name: str, version_number: int, timeout: int = 60
