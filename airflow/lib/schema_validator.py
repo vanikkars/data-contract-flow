@@ -164,6 +164,13 @@ class SchemaSafetyValidator:
             - message: Human-readable explanation
             - requires_migration: Needs data migration plan
         """
+        # Logical types (decimal, timestamp) are checked first: they are carried
+        # on top of a physical base type, so a naive base-type comparison sees
+        # bytes -> bytes or long -> long and waves through silent corruption.
+        logical_result = self._check_logical_type_change(old_type, new_type)
+        if logical_result is not None:
+            return logical_result
+
         # Normalize union types (e.g., ["null", "string"])
         old_base = self._normalize_type(old_type)
         new_base = self._normalize_type(new_type)
@@ -217,6 +224,148 @@ class SchemaSafetyValidator:
 
         # Other changes require migration planning
         return False, "type change requires data migration (schema versioning needed)", True
+
+    def _extract_logical_type(self, avro_type: Any) -> Optional[Dict[str, Any]]:
+        """Pull the logical-type descriptor out of an AVRO type, if present.
+
+        Handles unions, so ["null", {"type": "bytes", "logicalType": "decimal"}]
+        resolves to the inner descriptor.
+        """
+        if isinstance(avro_type, list):
+            for member in avro_type:
+                if member == "null":
+                    continue
+                found = self._extract_logical_type(member)
+                if found:
+                    return found
+            return None
+
+        if isinstance(avro_type, dict) and "logicalType" in avro_type:
+            return avro_type
+
+        return None
+
+    def _check_logical_type_change(
+        self, old_type: Any, new_type: Any
+    ) -> Optional[Tuple[bool, str, bool]]:
+        """Validate a change between AVRO logical types.
+
+        Returns None when neither side carries a logical type, letting the
+        caller fall through to plain base-type comparison.
+        """
+        old_logical = self._extract_logical_type(old_type)
+        new_logical = self._extract_logical_type(new_type)
+
+        if old_logical is None and new_logical is None:
+            return None
+
+        # Dropping or adding a logical type reinterprets the same physical bytes
+        # (e.g. long as epoch-millis vs. a plain counter). Values do not change,
+        # meaning changes.
+        if old_logical is None or new_logical is None:
+            return (
+                False,
+                "logical type added or removed — the same stored bytes will be "
+                "reinterpreted (e.g. epoch value vs. plain integer). Existing "
+                "rows will read with different meaning.",
+                False,
+            )
+
+        old_name = old_logical.get("logicalType")
+        new_name = new_logical.get("logicalType")
+
+        if old_name != new_name:
+            return self._check_logical_type_swap(old_name, new_name)
+
+        if old_name == "decimal":
+            return self._check_decimal_change(old_logical, new_logical)
+
+        return True, "No logical type change", False
+
+    def _check_logical_type_swap(
+        self, old_name: str, new_name: str
+    ) -> Tuple[bool, str, bool]:
+        """Validate a change from one logical type to a different one."""
+        # timestamp-millis -> timestamp-micros is AVRO-compatible (both are long)
+        # but shifts every value by 1000x in engines that read the raw long.
+        timestamp_units = {
+            "timestamp-millis": 1_000,
+            "timestamp-micros": 1_000_000,
+            "time-millis": 1_000,
+            "time-micros": 1_000_000,
+        }
+
+        if old_name in timestamp_units and new_name in timestamp_units:
+            old_unit = timestamp_units[old_name]
+            new_unit = timestamp_units[new_name]
+            factor = max(old_unit, new_unit) // min(old_unit, new_unit)
+            direction = "inflated" if new_unit > old_unit else "truncated"
+
+            return (
+                False,
+                f"{old_name} → {new_name}: AVRO-compatible (both are long) but "
+                f"every existing timestamp is silently {direction} by {factor}x. "
+                f"Requires backfill of all historical rows.",
+                False,
+            )
+
+        return (
+            False,
+            f"logical type {old_name} → {new_name} changes how stored values are "
+            f"interpreted. Requires migration and consumer coordination.",
+            False,
+        )
+
+    def _check_decimal_change(
+        self, old_logical: Dict[str, Any], new_logical: Dict[str, Any]
+    ) -> Tuple[bool, str, bool]:
+        """Validate a decimal precision/scale change.
+
+        Narrowing precision truncates large values; any scale change rescales
+        every stored value. Both pass AVRO compatibility because the underlying
+        type is bytes in each case.
+        """
+        old_precision = old_logical.get("precision")
+        old_scale = old_logical.get("scale", 0)
+        new_precision = new_logical.get("precision")
+        new_scale = new_logical.get("scale", 0)
+
+        if old_precision is None or new_precision is None:
+            return (
+                False,
+                "decimal type missing precision — cannot verify the change is safe",
+                False,
+            )
+
+        old_repr = f"DECIMAL({old_precision},{old_scale})"
+        new_repr = f"DECIMAL({new_precision},{new_scale})"
+
+        if old_scale != new_scale:
+            return (
+                False,
+                f"{old_repr} → {new_repr}: scale change silently rescales every "
+                f"stored value. AVRO reports this as compatible (both are bytes). "
+                f"This is the DECIMAL(18,4) → DECIMAL(10,2) financial-corruption case.",
+                False,
+            )
+
+        if new_precision < old_precision:
+            return (
+                False,
+                f"{old_repr} → {new_repr}: precision narrowing truncates values "
+                f"that no longer fit. AVRO reports this as compatible (both are "
+                f"bytes) — the data loss is silent.",
+                False,
+            )
+
+        if new_precision > old_precision:
+            return (
+                True,
+                f"{old_repr} → {new_repr}: precision widening at equal scale is safe",
+                False,
+            )
+
+        return True, "No decimal change", False
 
     def _check_new_required_fields(self, old_fields: Dict, new_fields: Dict) -> List[Dict]:
         """Check for new required fields without defaults."""
@@ -392,7 +541,16 @@ class SchemaSafetyValidator:
     def _format_type(self, avro_type: Any) -> str:
         """Format AVRO type for display."""
         if isinstance(avro_type, list):
-            return " | ".join(avro_type)
+            return " | ".join(self._format_type(t) for t in avro_type)
+
+        if isinstance(avro_type, dict):
+            logical = avro_type.get("logicalType")
+            if logical == "decimal":
+                return f"decimal({avro_type.get('precision')},{avro_type.get('scale', 0)})"
+            if logical:
+                return str(logical)
+            return str(avro_type.get("type", avro_type))
+
         return str(avro_type)
 
 

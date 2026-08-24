@@ -19,6 +19,28 @@ from lib.schema_validator import SchemaSafetyValidator, DownstreamImpactAnalyzer
 
 logger = logging.getLogger(__name__)
 
+# Compatibility modes considered strong enough for a source-aligned raw layer.
+#
+# FULL_ALL forbids both field removal and required-field addition, and checks
+# transitively against every prior version — not just the latest. Transitivity
+# matters for Iceberg because a table retains data written under every
+# historical schema version, so a non-transitive check can approve a change
+# that breaks readers of data still sitting in old snapshots.
+SAFE_COMPATIBILITY_MODES = {"FULL_ALL", "FULL"}
+
+# BACKWARD is the registry default and explicitly permits field deletion, which
+# is a guaranteed downstream SQL break. Kept usable but never silently.
+WEAK_COMPATIBILITY_MODES = {
+    "BACKWARD": "permits field deletion — downstream SQL queries will fail",
+    "BACKWARD_ALL": "permits field deletion — downstream SQL queries will fail",
+    "FORWARD": "permits adding required fields — INSERT statements will fail",
+    "FORWARD_ALL": "permits adding required fields — INSERT statements will fail",
+    "NONE": "no compatibility checking at all",
+    "DISABLED": "no compatibility checking at all",
+}
+
+DEFAULT_COMPATIBILITY = "FULL_ALL"
+
 
 class AwsGlueAdapter:
     """Unified adapter for AWS Glue Schema Registry and Iceberg operations."""
@@ -49,7 +71,7 @@ class AwsGlueAdapter:
         self,
         contract: DataContract,
         data_format: str = "AVRO",
-        compatibility: str = "FORWARD_ALL",
+        compatibility: str = DEFAULT_COMPATIBILITY,
         enforce_sql_safety: bool = None,
     ) -> str:
         """Register a data contract as a schema in the registry.
@@ -57,7 +79,9 @@ class AwsGlueAdapter:
         Args:
             contract: The data contract to register
             data_format: Schema format (AVRO, PROTOBUF, JSON)
-            compatibility: Compatibility mode (BACKWARD, FORWARD, BOTH, FORWARD_ALL, DISABLED)
+            compatibility: Compatibility mode. Defaults to FULL_ALL; anything
+                weaker is permitted but logged as a warning (see
+                WEAK_COMPATIBILITY_MODES)
             enforce_sql_safety: If True, enforce SQL-safety checks (overrides instance setting)
 
         Returns:
@@ -70,6 +94,8 @@ class AwsGlueAdapter:
         schema_name = contract.contract_id
         description = contract.description or f"Schema for {schema_name}"
         schema_definition = contract_to_avro(contract)
+
+        self._warn_on_weak_compatibility(schema_name, compatibility)
 
         # Use instance setting if not overridden
         enforce_sql_safety = enforce_sql_safety if enforce_sql_safety is not None else self.enforce_sql_safety
@@ -490,6 +516,25 @@ class AwsGlueAdapter:
     # ============================================================================
     # Private Helper Methods
     # ============================================================================
+
+    def _warn_on_weak_compatibility(self, schema_name: str, compatibility: str) -> None:
+        """Log a loud warning when registering under a mode weaker than FULL_ALL.
+
+        The mode is not overridden — the caller may have a deliberate reason —
+        but the SQL-safety validator becomes the only thing standing between a
+        weak mode and a downstream break, so the choice is never silent.
+        """
+        mode = (compatibility or "").upper()
+
+        if mode in SAFE_COMPATIBILITY_MODES:
+            return
+
+        reason = WEAK_COMPATIBILITY_MODES.get(mode, "not a recognised strong mode")
+        logger.warning(
+            f"⚠️  Schema '{schema_name}' uses compatibility mode {mode}: {reason}. "
+            f"Recommended: {DEFAULT_COMPATIBILITY}. SQL-safety validation is now the "
+            f"only gate protecting downstream consumers."
+        )
 
     def _wait_for_version_validation(
         self, schema_name: str, version_number: int, timeout: int = 60
