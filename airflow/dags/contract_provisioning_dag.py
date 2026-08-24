@@ -67,6 +67,27 @@ dag = DAG(
 # Task Functions
 # ============================================================================
 
+def get_conf(context, key: str, default=None):
+    """Read a run parameter from dag_run.conf, falling back to an Airflow Variable.
+
+    The GitHub Actions workflow passes `changed_files`, `process_all` and
+    `github_pr_number` in the DAG run's `conf` payload. Reading these only from
+    Variables silently ignored everything the trigger sent: `changed_files`
+    resolved to None on every webhook-triggered run, so no contract was ever
+    processed and every downstream task was skipped.
+
+    conf wins because it is per-run; Variables remain the deployment-wide
+    default for manual runs.
+    """
+    dag_run = context.get("dag_run")
+    conf = getattr(dag_run, "conf", None) or {}
+
+    if key in conf and conf[key] not in (None, ""):
+        return conf[key]
+
+    return Variable.get(key, default)
+
+
 def task_fetch_contracts(**context):
     """Fetch contract files from repository.
 
@@ -74,10 +95,15 @@ def task_fetch_contracts(**context):
     """
     logger.info("🔍 Starting contract provisioning DAG")
 
-    repo_path = Variable.get("repo_path", "/app")
-    contracts_dir = Variable.get("contracts_dir", "contracts/current")
-    changed_files = Variable.get("changed_files", None)
-    process_all = Variable.get("process_all", False)
+    repo_path = get_conf(context, "repo_path", "/app")
+    contracts_dir = get_conf(context, "contracts_dir", "contracts/current")
+    changed_files = get_conf(context, "changed_files", None)
+    process_all = get_conf(context, "process_all", False)
+
+    logger.info(
+        f"Run parameters: contracts_dir={contracts_dir}, "
+        f"process_all={process_all}, changed_files={changed_files!r}"
+    )
 
     # Parse changed_files if it's a space-separated string
     if changed_files and isinstance(changed_files, str):
@@ -90,8 +116,22 @@ def task_fetch_contracts(**context):
     contract_files = ContractTasks.fetch_contract_files(repo_path, contracts_dir, changed_files, process_all)
 
     if not contract_files:
-        logger.warning("⚠️  No contract files found")
-        return []
+        # Returning [] here would expand into zero downstream tasks, so every
+        # validation task is SKIPPED and the run reports success without having
+        # checked anything. A provisioning run that finds nothing to provision
+        # is a misconfiguration, so fail loudly instead.
+        raise ValueError(
+            "No contract files to process — refusing to report success.\n"
+            f"  repo_path:     {repo_path}\n"
+            f"  contracts_dir: {contracts_dir}\n"
+            f"  changed_files: {changed_files!r}\n"
+            f"  process_all:   {process_all}\n"
+            "\n"
+            "Nothing would be validated, so downstream tasks would be skipped "
+            "and the PR comment would show a misleading pass.\n"
+            "Fix the trigger (is `changed_files` populated?) or set "
+            "`process_all=true` to provision every contract."
+        )
 
     logger.info(f"📋 Found {len(contract_files)} contract files")
     return contract_files
@@ -210,7 +250,7 @@ def task_collect_results(validation_results: List[Dict],
     # Format for GitHub
     github_payload = GitHubTasks.get_pr_comment_body(
         aggregated,
-        github_pr_number=Variable.get("github_pr_number", None)
+        github_pr_number=get_conf(context, "github_pr_number", None)
     )
 
     ti.xcom_push(key="github_payload", value=github_payload)

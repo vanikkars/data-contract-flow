@@ -7,9 +7,32 @@ from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# Rendered whenever a run processed zero contracts.
+#
+# "Nothing was checked" and "everything passed" are both `0 == 0`, so without an
+# explicit guard every formatter reports success for a run that never validated
+# anything. That turns the provisioning gate into a rubber stamp precisely when
+# it failed to do its job.
+NO_CONTRACTS_WARNING = (
+    "⚠️ **No contracts were processed — nothing was validated.**\n\n"
+    "This is NOT a passing result. The pipeline did not check any contract, so "
+    "no statement can be made about whether the proposed changes are safe.\n\n"
+    "Common causes:\n"
+    "- The changed-files detection produced an empty list (check `git merge-base` "
+    "resolution in the trigger workflow)\n"
+    "- The DAG was triggered without `changed_files` and without `process_all`\n"
+    "- The contracts directory path is misconfigured\n\n"
+    "**Do not merge on the strength of this comment.**\n\n"
+)
+
 
 class GitHubTasks:
     """Tasks for GitHub integration."""
+
+    @staticmethod
+    def _no_contracts_processed(results: Dict[str, Any]) -> bool:
+        """True when the run processed no contracts at all."""
+        return results.get("total_contracts", 0) == 0
 
     @staticmethod
     def format_validation_comment(results: Dict[str, Any]) -> str:
@@ -25,6 +48,9 @@ class GitHubTasks:
 
         total = results.get("total_contracts", 0)
         validation_passed = results.get("validation_passed", 0)
+
+        if GitHubTasks._no_contracts_processed(results):
+            return "## ⚠️ Schema Validation Results\n\n" + NO_CONTRACTS_WARNING
 
         comment = "## ✅ Schema Validation Results\n\n"
 
@@ -67,6 +93,13 @@ class GitHubTasks:
         schema_registered = results.get("schema_registered", 0)
         total = results.get("total_contracts", 0)
 
+        if GitHubTasks._no_contracts_processed(results):
+            return (
+                "## ⚠️ Schema Registration Results\n\n"
+                "No schemas were registered — no contracts were processed. "
+                "SQL-safety validation did not run.\n\n"
+            )
+
         comment = "## 📋 Schema Registration Results\n\n"
 
         if schema_registered == total:
@@ -108,6 +141,12 @@ class GitHubTasks:
         tables_created = results.get("tables_created", 0)
         tables_updated = results.get("tables_updated", 0)
         total = results.get("total_contracts", 0)
+
+        if GitHubTasks._no_contracts_processed(results):
+            return (
+                "## ⚠️ Iceberg Table Results\n\n"
+                "No tables were created or updated — no contracts were processed.\n\n"
+            )
 
         comment = "## 🗄️ Iceberg Table Results\n\n"
 
@@ -185,6 +224,15 @@ class GitHubTasks:
             comment += "All validations passed! Reply with:\n\n"
             comment += "```\n/approve-merge\n```\n\n"
             comment += "This will automatically merge the PR with all changes.\n"
+        elif total == 0:
+            comment += "---\n\n"
+            comment += "## 🛑 Pipeline Did Not Run\n\n"
+            comment += (
+                "Zero contracts were processed, so **no validation took place**. "
+                "This is a pipeline failure, not an approval.\n\n"
+                "Investigate why no contracts reached the DAG before merging "
+                "anything in this PR.\n"
+            )
         else:
             comment += "---\n\n"
             comment += "## ⚠️ Action Required\n\n"
