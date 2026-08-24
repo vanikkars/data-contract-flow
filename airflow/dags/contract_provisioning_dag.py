@@ -88,6 +88,46 @@ def get_conf(context, key: str, default=None):
     return Variable.get(key, default)
 
 
+def normalize_mapped_output(results) -> List[Dict[str, Any]]:
+    """Coerce the output of a dynamically-mapped task into a list of dicts.
+
+    Airflow hands mapped-task output over as a LazyXComSelectSequence, which is
+    iterable but is NOT a list. An `isinstance(x, list)` check therefore fails
+    and wrapping it as `[x]` yields a list containing the sequence itself — so
+    the caller ends up calling .get() on the sequence rather than on each
+    result, raising AttributeError.
+
+    Iterating is the reliable contract: it works for the lazy sequence, a plain
+    list, and a single dict alike. Non-dict entries (a task that returned
+    nothing, or a skipped mapped instance) are dropped with a warning rather
+    than corrupting the aggregate counts.
+    """
+    if results is None:
+        return []
+
+    # A bare dict is iterable over its keys, so it must be handled first.
+    if isinstance(results, dict):
+        return [results]
+
+    try:
+        candidates = list(results)
+    except TypeError:
+        logger.warning(f"Unexpected mapped output type {type(results).__name__}; ignoring")
+        return []
+
+    normalized = []
+    for item in candidates:
+        if isinstance(item, dict):
+            normalized.append(item)
+        elif item is not None:
+            logger.warning(
+                f"Discarding non-dict result of type {type(item).__name__} "
+                f"from mapped task output"
+            )
+
+    return normalized
+
+
 def task_fetch_contracts(**context):
     """Fetch contract files from repository.
 
@@ -250,10 +290,15 @@ def task_collect_results(validation_results: List[Dict],
 
     logger.info("📊 Collecting results from all contract processing tasks")
 
-    # Ensure we have lists
-    validation_results = validation_results if isinstance(validation_results, list) else [validation_results] if validation_results else []
-    schema_results = schema_results if isinstance(schema_results, list) else [schema_results] if schema_results else []
-    table_results = table_results if isinstance(table_results, list) else [table_results] if table_results else []
+    # Normalise mapped-task output into a plain list of dicts.
+    validation_results = normalize_mapped_output(validation_results)
+    schema_results = normalize_mapped_output(schema_results)
+    table_results = normalize_mapped_output(table_results)
+
+    logger.info(
+        f"Collected {len(validation_results)} validation, "
+        f"{len(schema_results)} schema, {len(table_results)} table result(s)"
+    )
 
     # Collect results via ContractTasks library
     aggregated = ContractTasks.collect_results(validation_results, schema_results, table_results)
