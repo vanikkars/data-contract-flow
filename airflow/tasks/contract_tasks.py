@@ -136,7 +136,7 @@ class ContractTasks:
             raise
 
     @staticmethod
-    async def create_iceberg_table(contract_path: str) -> Dict[str, Any]:
+    def create_iceberg_table(contract_path: str) -> Dict[str, Any]:
         """Create an Iceberg table in AWS Glue Catalog.
 
         Args:
@@ -193,7 +193,7 @@ class ContractTasks:
 
             # Get existing table if it exists to detect changes
             adapter = AwsGlueAdapter()
-            existing_table = await adapter.get_table(table.table_name)
+            existing_table = adapter.get_table(table.table_name)
 
             if existing_table:
                 logger.info(f"📋 Table exists: {table.table_name}, checking for changes")
@@ -207,15 +207,15 @@ class ContractTasks:
 
                 if added or removed or existing_table.version != table.version:
                     logger.info(f"✏️  Updating table: +{len(added)} -{len(removed)} columns")
-                    await adapter.update_table(table)
+                    adapter.update_table(table)
                     status = "updated"
                 else:
                     logger.info(f"✔️  No schema changes detected for {table.table_name}")
                     status = "unchanged"
             else:
                 logger.info(f"✨ Creating new table: {table.table_name}")
-                await adapter.create_database_if_not_exists(table.database_name)
-                await adapter.create_table(table)
+                adapter.create_database_if_not_exists(table.database_name)
+                adapter.create_table(table)
                 status = "created"
 
             logger.info(f"✅ Iceberg table {status}: {table.table_name}")

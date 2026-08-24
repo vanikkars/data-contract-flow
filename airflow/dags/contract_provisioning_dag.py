@@ -208,7 +208,21 @@ def task_create_table(validation_result: Dict[str, Any], **context):
 
     try:
         table_result = ContractTasks.create_iceberg_table(contract_path)
-        logger.info(f"✅ Created/updated table for {contract_id}")
+
+        # An un-awaited coroutine is truthy and returns instantly, so calling an
+        # async function without awaiting it logged success for work that never
+        # ran. The path is synchronous now; this guard keeps a silent
+        # regression from reaching XCom as an apparent pass.
+        if not isinstance(table_result, dict):
+            raise TypeError(
+                f"create_iceberg_table returned {type(table_result).__name__}, "
+                f"expected dict. The table was NOT provisioned."
+            )
+
+        logger.info(
+            f"✅ Table {table_result.get('status', 'processed')} for {contract_id}: "
+            f"{table_result.get('table_name')}"
+        )
         return table_result
     except Exception as e:
         logger.error(f"❌ Table creation failed for {contract_id}: {str(e)}")

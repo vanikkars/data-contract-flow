@@ -365,7 +365,7 @@ class AwsGlueAdapter:
     # Iceberg Table Operations
     # ============================================================================
 
-    async def create_table(self, table: IcebergTable) -> None:
+    def create_table(self, table: IcebergTable) -> None:
         """Create a new Iceberg table.
 
         Args:
@@ -411,7 +411,7 @@ class AwsGlueAdapter:
             logger.error(f"Failed to create table: {str(e)}")
             raise TableCreationError(f"Failed to create table: {str(e)}")
 
-    async def get_table(self, table_name: str, database_name: str = "iceberg_tables") -> Optional[IcebergTable]:
+    def get_table(self, table_name: str, database_name: str = "iceberg_tables") -> Optional[IcebergTable]:
         """Get table from Glue and reconstruct as IcebergTable object."""
         try:
             logger.debug(f"Retrieving table {table_name} from database {database_name}")
@@ -457,7 +457,7 @@ class AwsGlueAdapter:
             logger.error(f"Error retrieving table {table_name}: {str(e)}", exc_info=True)
             return None
 
-    async def table_exists(self, table_name: str, database_name: str = "iceberg_tables") -> bool:
+    def table_exists(self, table_name: str, database_name: str = "iceberg_tables") -> bool:
         """Check if table exists in Glue."""
         try:
             self.glue.get_table(DatabaseName=database_name, Name=table_name)
@@ -468,7 +468,7 @@ class AwsGlueAdapter:
             logger.error(f"Error checking table existence: {str(e)}")
             raise TableCreationError(f"Failed to check table existence: {str(e)}")
 
-    async def update_table(self, table: IcebergTable) -> None:
+    def update_table(self, table: IcebergTable) -> None:
         """Update table schema."""
         try:
             response = self.glue.get_table(
@@ -502,7 +502,7 @@ class AwsGlueAdapter:
             logger.error(f"Failed to update table: {str(e)}")
             raise TableCreationError(f"Failed to update table: {str(e)}")
 
-    async def create_database_if_not_exists(self, database_name: str) -> None:
+    def create_database_if_not_exists(self, database_name: str) -> None:
         """Create database if needed."""
         try:
             self.glue.create_database(DatabaseInput={"Name": database_name})
