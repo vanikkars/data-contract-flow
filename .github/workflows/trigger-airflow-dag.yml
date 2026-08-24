@@ -245,8 +245,18 @@ jobs:
           cat /tmp/comment_body.txt >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          # Save DAG run URL for later use
-          DAG_RUN_URL="$AIRFLOW_URL/dags/${{ env.AIRFLOW_DAG_ID }}/runs/$DAG_RUN_ID"
+          # Save DAG run URL for later use.
+          #
+          # Airflow 2.x addresses a specific run through the grid view with the
+          # run id as a query parameter, not as a path segment:
+          #   /dags/<dag_id>/grid?dag_run_id=<encoded>
+          #
+          # The run id contains ':' and '+' (e.g.
+          # manual__2026-08-24T13:02:57.288406+00:00). Left raw, the '+' is
+          # decoded as a space and the link resolves to no run at all, so the
+          # id must be percent-encoded.
+          ENCODED_RUN_ID=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$DAG_RUN_ID")
+          DAG_RUN_URL="$AIRFLOW_URL/dags/${{ env.AIRFLOW_DAG_ID }}/grid?dag_run_id=$ENCODED_RUN_ID"
           echo "dag_run_url=$DAG_RUN_URL" >> $GITHUB_OUTPUT
 
           echo "✅ Results fetched successfully"
@@ -284,6 +294,8 @@ jobs:
       - name: Set PR status check
         if: always()
         uses: actions/github-script@v7
+        env:
+          DAG_RUN_URL: ${{ steps.fetch-results.outputs.dag_run_url }}
         with:
           script: |
             const state = '${{ steps.wait-dag.outputs.state }}' === 'success' ? 'success' : 'failure';
@@ -301,6 +313,6 @@ jobs:
               output: {
                 title: 'Contract Provisioning via Airflow',
                 summary: description,
-                text: 'View detailed logs in Airflow UI: ${{ secrets.AIRFLOW_URL }}/dags/${{ env.AIRFLOW_DAG_ID }}/runs'
+                text: 'View detailed logs in Airflow UI: ' + (process.env.DAG_RUN_URL || '${{ secrets.AIRFLOW_URL }}/dags/${{ env.AIRFLOW_DAG_ID }}/grid')
               }
             });
